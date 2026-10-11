@@ -145,8 +145,47 @@ pub struct BoothcraftApp {
     _cleanup: boothcraft_core::CleanupGuard,
 }
 
+/// On macOS, prefer the system's own San Francisco fonts over egui's bundled default (Ubuntu-Light),
+/// so Boothcraft's text matches the rest of the OS. Reads the files the OS already has installed
+/// at their standard location, rather than embedding/redistributing them; falls back silently to
+/// egui's defaults (other platforms, or a future macOS that moves them) if they can't be read.
+#[cfg(target_os = "macos")]
+fn install_native_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let faces: [(&str, &str, egui::FontFamily); 2] = [
+        (
+            "SF Pro",
+            "/System/Library/Fonts/SFNS.ttf",
+            egui::FontFamily::Proportional,
+        ),
+        (
+            "SF Mono",
+            "/System/Library/Fonts/SFNSMono.ttf",
+            egui::FontFamily::Monospace,
+        ),
+    ];
+    for (name, path, family) in faces {
+        let Ok(data) = std::fs::read(path) else {
+            continue;
+        };
+        fonts
+            .font_data
+            .insert(name.to_owned(), Arc::new(egui::FontData::from_owned(data)));
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, name.to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_native_fonts(_ctx: &egui::Context) {}
+
 impl BoothcraftApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> BoothcraftApp {
+    pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> BoothcraftApp {
+        install_native_fonts(&cc.egui_ctx);
         let cleanup = boothcraft_core::install_cleanup_guard();
         // Editor on top; Selection/View, Phase Meter and Levels side by side underneath. The split
         // fraction is the share kept by the *existing* node.
@@ -1495,7 +1534,7 @@ impl TabViewer for Viewer<'_> {
                     ui.allocate_ui(size, |ui| {
                         ui.centered_and_justified(|ui| {
                             if ui
-                                .button("Open an audio file…  (⌘O or drop a file here)")
+                                .button("Open an audio file…  (Cmd+O or drop a file here)")
                                 .clicked()
                             {
                                 s.pick_and_open();
