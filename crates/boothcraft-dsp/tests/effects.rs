@@ -34,7 +34,7 @@ fn signal(n: usize, seed: u32) -> Vec<f32> {
 
 /// Give every parameter a non-default value so more code paths run.
 fn exercise_params(e: &mut dyn Effect) {
-    let specs = e.specs();
+    let specs = e.specs().to_vec();
     for (i, s) in specs.iter().enumerate() {
         e.set_param(i, s.from_normalized(0.37 + 0.05 * (i % 5) as f32));
     }
@@ -115,11 +115,11 @@ fn every_effect_has_sane_specs() {
         let (specs, values) = match &info.kind {
             registry::Kind::Realtime(make) => {
                 let e = make();
-                (e.specs(), e.values().to_vec())
+                (e.specs().to_vec(), e.values().to_vec())
             }
             registry::Kind::Offline(make) => {
                 let e = make();
-                (e.specs(), e.values().to_vec())
+                (e.specs().to_vec(), e.values().to_vec())
             }
         };
         assert_eq!(specs.len(), values.len(), "{}", info.id);
@@ -202,7 +202,7 @@ fn parameter_changes_do_not_allocate() {
         let mut e = registry::create(info.id).unwrap();
         e.prepare(RATE, 2, MAX_BLOCK);
         e.reset();
-        let specs = e.specs();
+        let specs = e.specs().to_vec();
         for (i, s) in specs.iter().enumerate() {
             for t in [0.0, 0.5, 1.0] {
                 let v = s.from_normalized(t);

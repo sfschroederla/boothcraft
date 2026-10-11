@@ -24,11 +24,32 @@ pub enum Owner {
 pub struct Preview {
     ctl: Option<RackControl>,
     owner: Option<Owner>,
+    /// Channels of the playing document. The preview rack runs on these (up to the device's
+    /// count), before they are mapped onto the outputs, so it matches what Apply produces.
+    doc_channels: usize,
+    /// The rack last installed, to rebuild it if the document's channel count changes.
+    installed: Option<RackDesc>,
 }
 
 impl Preview {
     pub fn new(ctl: Option<RackControl>) -> Preview {
-        Preview { ctl, owner: None }
+        Preview {
+            ctl,
+            owner: None,
+            doc_channels: 2,
+            installed: None,
+        }
+    }
+
+    /// Tell the preview how many channels the active document has.
+    pub fn set_doc_channels(&mut self, channels: usize) {
+        let channels = channels.max(1);
+        if channels != self.doc_channels {
+            self.doc_channels = channels;
+            if let (Some(_), Some(desc)) = (self.owner, self.installed.clone()) {
+                self.install(&desc);
+            }
+        }
     }
 
     pub fn available(&self) -> bool {
@@ -98,8 +119,10 @@ impl Preview {
 
     fn install(&mut self, desc: &RackDesc) {
         if let Some(c) = &mut self.ctl {
-            let rack = Rack::new(desc, c.sample_rate as f32, c.channels, 1024);
+            let channels = self.doc_channels.min(c.channels).max(1);
+            let rack = Rack::new(desc, c.sample_rate as f32, channels, 1024);
             c.send(RackMsg::Install(Box::new(rack)));
+            self.installed = Some(desc.clone());
         }
     }
 
@@ -505,15 +528,15 @@ impl RackPanel {
         ui.separator();
         if let Some(i) = self.selected {
             if let Some(slot) = &mut self.desc.slots[i] {
-                if let (Some(info), Some(fx)) =
-                    (registry::info(&slot.effect), registry::create(&slot.effect))
+                if let (Some(info), Some(specs)) =
+                    (registry::info(&slot.effect), registry::specs(&slot.effect))
                 {
                     ui.label(RichText::new(info.name).strong());
                     for (k, v) in effect_editor(
                         ui,
                         ("rack_params", i),
                         &slot.effect,
-                        fx.specs(),
+                        specs,
                         &mut slot.values,
                     ) {
                         preview.param(Owner::Rack, i, k, v);
@@ -620,10 +643,7 @@ impl EffectDialog {
     }
 
     fn specs(&self) -> &'static [boothcraft_dsp::ParamSpec] {
-        match registry::create(self.id) {
-            Some(fx) => fx.specs(),
-            None => registry::create_offline(self.id).map_or(&[], |fx| fx.specs()),
-        }
+        registry::specs(self.id).unwrap_or(&[])
     }
 
     fn values_mut(&mut self) -> &mut Vec<f32> {

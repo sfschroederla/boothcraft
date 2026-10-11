@@ -8,6 +8,13 @@ use boothcraft_dsp::Rack;
 
 pub enum RackMsg {
     Install(Box<Rack>),
+    /// Install `rack`, first moving live effects from the current rack into it: slot `i` takes
+    /// the old rack's slot `carry[i]` (`CARRY_NONE` = nothing). Used for plugin instances, which
+    /// must survive edits and preview toggles instead of being re-created. Pointer moves only.
+    Rebuild {
+        rack: Box<Rack>,
+        carry: [u8; boothcraft_dsp::rack::SLOTS],
+    },
     Clear,
     Param {
         slot: u8,
@@ -43,9 +50,15 @@ impl RackControl {
         ok
     }
 
-    /// Drop racks the audio thread has finished with.
+    /// Drop racks the audio thread has finished with. Only for callers without plugins; a plugin
+    /// host uses [`RackControl::drain_trash`] so retired plugin processors are parked, not dropped.
     pub fn collect_garbage(&mut self) {
         while self.trash.pop().is_ok() {}
+    }
+
+    /// Racks the audio thread has finished with, for the caller to retire on the UI thread.
+    pub fn drain_trash(&mut self) -> Vec<Box<Rack>> {
+        std::iter::from_fn(|| self.trash.pop().ok()).collect()
     }
 }
 

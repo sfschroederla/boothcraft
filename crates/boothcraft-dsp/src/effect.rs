@@ -6,8 +6,11 @@ use crate::param::ParamSpec;
 ///
 /// `process` runs on the audio thread: it must not allocate, lock or block. Buffers are planar
 /// (one slice per channel, all the same length, never longer than `max_block` from `prepare`).
+/// `Drop` never runs on the audio thread: the engine hands retired racks back to the UI thread.
+///
+/// Built-in effects return a `'static` slice; plugin effects return specs owned by the instance.
 pub trait Effect: Send {
-    fn specs(&self) -> &'static [ParamSpec];
+    fn specs(&self) -> &[ParamSpec];
     fn values(&self) -> &[f32];
     fn values_mut(&mut self) -> &mut [f32];
 
@@ -25,6 +28,11 @@ pub trait Effect: Send {
         0
     }
 
+    /// Frames of output that follow the input ending (reverb and delay tails), if known.
+    fn tail(&self) -> usize {
+        0
+    }
+
     fn set_param(&mut self, index: usize, value: f32) {
         if let Some(spec) = self.specs().get(index) {
             let v = spec.clamp(value);
@@ -39,9 +47,10 @@ pub trait Effect: Send {
 
     /// Set every parameter at once (presets), updating once.
     fn set_all(&mut self, values: &[f32]) {
-        let specs = self.specs();
-        for ((v, spec), new) in self.values_mut().iter_mut().zip(specs).zip(values) {
-            *v = spec.clamp(*new);
+        let n = self.specs().len().min(values.len());
+        for (i, new) in values.iter().enumerate().take(n) {
+            let spec = self.specs()[i];
+            self.values_mut()[i] = spec.clamp(*new);
         }
         self.update();
     }

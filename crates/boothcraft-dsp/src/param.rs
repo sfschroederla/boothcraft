@@ -10,6 +10,8 @@ pub enum Unit {
     Percent,
     Ratio,
     Seconds,
+    /// A plugin-defined unit; the string is its display suffix (include any leading space).
+    Custom(&'static str),
 }
 
 impl Unit {
@@ -22,6 +24,7 @@ impl Unit {
             Unit::Percent => " %",
             Unit::Ratio => ":1",
             Unit::Seconds => " s",
+            Unit::Custom(s) => s,
         }
     }
 }
@@ -32,6 +35,16 @@ pub enum Curve {
     Linear,
     /// Logarithmic (for frequencies and times); requires `min > 0`.
     Log,
+}
+
+/// Parameter behaviour flags (`ParamSpec::flags`).
+pub mod flags {
+    /// Not shown in generic parameter UIs (plugin-internal parameters, program change).
+    pub const HIDDEN: u8 = 1;
+    /// Shown but not editable (meters and other output parameters).
+    pub const READ_ONLY: u8 = 2;
+    /// The plugin's own bypass switch.
+    pub const BYPASS: u8 = 4;
 }
 
 /// A parameter's identity, range and default. `choices` non-empty means the value is an index
@@ -46,6 +59,11 @@ pub struct ParamSpec {
     pub default: f32,
     pub curve: Curve,
     pub choices: &'static [&'static str],
+    /// Number of discrete steps between `min` and `max` (0 = continuous). A stepped parameter
+    /// without `choices` is shown as a combo box of its values.
+    pub steps: u32,
+    /// Bitwise OR of [`flags`].
+    pub flags: u8,
 }
 
 impl ParamSpec {
@@ -66,6 +84,8 @@ impl ParamSpec {
             default,
             curve: Curve::Linear,
             choices: &[],
+            steps: 0,
+            flags: 0,
         }
     }
 
@@ -90,7 +110,27 @@ impl ParamSpec {
             default: default as f32,
             curve: Curve::Linear,
             choices,
+            steps: 0,
+            flags: 0,
         }
+    }
+
+    pub const fn with_flags(mut self, flags: u8) -> ParamSpec {
+        self.flags = flags;
+        self
+    }
+
+    pub const fn with_steps(mut self, steps: u32) -> ParamSpec {
+        self.steps = steps;
+        self
+    }
+
+    pub const fn is_hidden(&self) -> bool {
+        self.flags & (flags::HIDDEN | flags::BYPASS) != 0
+    }
+
+    pub const fn is_read_only(&self) -> bool {
+        self.flags & flags::READ_ONLY != 0
     }
 
     /// An on/off switch.
@@ -150,6 +190,31 @@ impl ParamSpec {
 /// Leak a generated name or id once, for parameter lists built at startup (e.g. EQ bands).
 pub fn leak(s: String) -> &'static str {
     Box::leak(s.into_boxed_str())
+}
+
+/// Like [`leak`], but each distinct string is leaked once, so memory stays bounded by the number of
+/// distinct strings however many times a plugin is scanned or reinstantiated.
+pub fn intern(s: &str) -> &'static str {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let mut pool = POOL
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(&hit) = pool.get(s) {
+        return hit;
+    }
+    let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    pool.insert(leaked);
+    leaked
+}
+
+/// Intern a list of strings into a `'static` slice (menu choices). The slice itself is leaked per
+/// call; callers cache the result for the lifetime of an instance.
+pub fn intern_list(items: &[String]) -> &'static [&'static str] {
+    let v: Vec<&'static str> = items.iter().map(|s| intern(s)).collect();
+    Box::leak(v.into_boxed_slice())
 }
 
 /// Default values for a parameter list.
@@ -229,6 +294,16 @@ mod tests {
             ParamSpec::new("g", "Gain", Unit::Db, -40.0, 40.0, 0.0).format(-3.25),
             "-3.25 dB"
         );
+    }
+
+    #[test]
+    fn intern_dedups_and_custom_units_format() {
+        let a = intern("Cutoff");
+        let b = intern(&String::from("Cutoff"));
+        assert!(std::ptr::eq(a, b));
+        let p = ParamSpec::new("p", "P", Unit::Custom(" st"), -12.0, 12.0, 0.0);
+        assert_eq!(p.format(3.0), "3.00 st");
+        assert!(p.with_flags(flags::BYPASS).is_hidden());
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod effects;
 pub mod generate;
 pub mod loudness;
 pub mod param;
+pub mod plugin_ref;
 pub mod preset;
 pub mod rack;
 pub mod registry;
@@ -15,7 +16,10 @@ pub mod stft;
 
 pub use effect::{Effect, Envelope, OfflineEffect};
 pub use param::{Curve, ParamSpec, Unit};
-pub use rack::{Rack, RackDesc, SlotDesc};
+pub use plugin_ref::{PluginRef, PluginState, SlotId};
+pub use rack::{
+    BuiltinSource, Rack, RackConfig, RackDesc, SlotDesc, SlotError, SlotSource, CARRY_NONE,
+};
 pub use stft::{
     SpectralEffect, SpectralFrame, SpectrumAnalyzer, StftProcessor, Window as StftWindow,
 };

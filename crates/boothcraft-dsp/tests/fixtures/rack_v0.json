@@ -1,0 +1,11 @@
+{
+  "slots": [
+    { "effect": "amplify", "values": [6.0], "bypass": false },
+    null,
+    { "effect": "hard_limiter", "values": [-1.0, 0.0, 10.0], "bypass": true },
+    null, null, null, null, null, null, null, null, null, null, null, null, null
+  ],
+  "input_gain_db": -3.0,
+  "output_gain_db": 1.5,
+  "mix": 0.75
+}

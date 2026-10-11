@@ -159,6 +159,9 @@ impl Shared {
 pub struct Renderer {
     shared: Arc<Shared>,
     scratch: Vec<Vec<f32>>,
+    /// Interpolated output, one buffer per document channel that reaches an output, so the preview
+    /// rack processes document channels before they are mapped onto device channels.
+    mapped: Vec<Vec<f32>>,
     link: Option<RackLink>,
     rack: Option<Box<Rack>>,
     rack_power: bool,
@@ -171,6 +174,7 @@ impl Renderer {
         Renderer {
             shared,
             scratch: Vec::new(),
+            mapped: Vec::new(),
             link: None,
             rack: None,
             rack_power: false,
@@ -197,6 +201,12 @@ impl Renderer {
         while let Ok(msg) = link.rx.pop() {
             let retired = match msg {
                 RackMsg::Install(rack) => self.rack.replace(rack),
+                RackMsg::Rebuild { mut rack, carry } => {
+                    if let Some(old) = &mut self.rack {
+                        rack.adopt(old, &carry);
+                    }
+                    self.rack.replace(rack)
+                }
                 RackMsg::Clear => self.rack.take(),
                 RackMsg::Param { slot, index, value } => {
                     if let Some(r) = &mut self.rack {
@@ -253,6 +263,13 @@ impl Renderer {
         while self.scratch.len() < doc_ch {
             self.scratch.push(vec![0.0; CHUNK + 4]);
         }
+        // Document channels that reach an output: all of them, up to the device's channel count.
+        let n_map = doc_ch.min(out_channels);
+        while self.mapped.len() < n_map {
+            self.mapped.push(vec![0.0; CHUNK + 4]);
+        }
+        let rack_active =
+            self.rack_power && self.rack.as_ref().is_some_and(|r| r.channels() == n_map);
         let frames = doc.frames();
         let step = doc.sample_rate as f64 / out_rate as f64;
         let gain = f32::from_bits(s.preview_gain.load(Relaxed));
@@ -321,7 +338,23 @@ impl Renderer {
                 let rel = pos - base as f64;
                 let i = rel.floor() as usize;
                 let frac = (rel - i as f64) as f32;
-                for oc in 0..out_channels {
+                for (c, dst) in self.mapped.iter_mut().enumerate().take(n_map) {
+                    let b = &self.scratch[c];
+                    dst[done] = (b[i] + (b[i + 1] - b[i]) * frac) * gain;
+                }
+                pos += step;
+                done += 1;
+            }
+            if rack_active {
+                if let Some(rack) = self.rack.as_mut() {
+                    rack.process_vecs(&mut self.mapped[..n_map], done);
+                }
+            }
+            // Map document channels onto outputs: a mono document plays on every output, and
+            // outputs past the document's channels stay silent.
+            for d in 0..done {
+                let frame = &mut out[(produced + d) * out_channels..][..out_channels];
+                for (oc, o) in frame.iter_mut().enumerate() {
                     let sc = if doc_ch == 1 {
                         Some(0)
                     } else if oc < doc_ch {
@@ -330,13 +363,9 @@ impl Renderer {
                         None
                     };
                     if let Some(sc) = sc {
-                        let b = &self.scratch[sc];
-                        let v = (b[i] + (b[i + 1] - b[i]) * frac) * gain;
-                        out[(produced + done) * out_channels + oc] = v;
+                        *o = self.mapped[sc][d];
                     }
                 }
-                pos += step;
-                done += 1;
             }
             produced += done;
             if done == 0 {
@@ -344,11 +373,6 @@ impl Renderer {
             }
         }
         let written = produced * out_channels;
-        if self.rack_power {
-            if let Some(rack) = self.rack.as_mut().filter(|r| r.channels() == out_channels) {
-                rack.process_interleaved(&mut out[..written]);
-            }
-        }
         if let Some(tap) = &mut self.tap {
             if let Ok(mut chunk) = tap.write_chunk(written) {
                 let (a, b) = chunk.as_mut_slices();
@@ -394,6 +418,9 @@ impl Renderer {
 mod tests {
     use super::*;
     use boothcraft_core::Rope;
+
+    #[global_allocator]
+    static ALLOC: assert_no_alloc::AllocDisabler = assert_no_alloc::AllocDisabler;
 
     fn ramp_doc(frames: usize, rate: u32) -> Arc<Document> {
         let v: Vec<f32> = (0..frames).map(|i| i as f32 / frames as f32).collect();
@@ -566,6 +593,143 @@ mod tests {
             ctl.trash.pop().is_ok(),
             "replaced rack handed back to the UI thread"
         );
+    }
+
+    #[test]
+    fn rebuild_keeps_the_live_effect_and_does_not_allocate() {
+        use boothcraft_dsp::{RackDesc, SlotDesc, CARRY_NONE};
+        let sh = Shared::new();
+        sh.set_document(ramp_doc(1000, 48_000));
+        sh.play();
+        let (mut ctl, link) = crate::rack_channel(48_000, 1);
+        let mut r = Renderer::new(sh.clone());
+        r.attach_rack(link);
+        let mut loud = RackDesc::single("amplify").unwrap();
+        loud.slots[0].as_mut().unwrap().values[0] = 20.0 * 2f32.log10();
+        ctl.send(RackMsg::Install(Box::new(Rack::new(
+            &loud, 48_000.0, 1, 256,
+        ))));
+        ctl.send(RackMsg::Power(true));
+        let mut out = vec![0.0; 300];
+        r.render(&mut out, 1, 48_000);
+        assert!((out[200] - 0.4).abs() < 1e-5);
+
+        // The rebuilt rack has a neutral amplify in slot 0 and a second one in slot 1; slot 0
+        // carries the live +6 dB instance over, so the sound must not change.
+        let mut next = RackDesc::default();
+        next.slots[0] = SlotDesc::new("amplify");
+        next.slots[1] = SlotDesc::new("amplify");
+        let rack = Box::new(Rack::new(&next, 48_000.0, 1, 256));
+        let mut carry = [CARRY_NONE; boothcraft_dsp::rack::SLOTS];
+        carry[0] = 0;
+        ctl.send(RackMsg::Rebuild { rack, carry });
+        assert_no_alloc::assert_no_alloc(|| r.poll_rack());
+        r.render(&mut out, 1, 48_000);
+        assert!(
+            (out[200] - 1.0).abs() < 1e-5,
+            "carried +6 dB effect still live, got {}",
+            out[200]
+        );
+        assert_eq!(
+            ctl.drain_trash().len(),
+            1,
+            "old rack comes back for retirement"
+        );
+    }
+
+    /// Counts the channels each `process` call sees.
+    struct Probe {
+        seen: Arc<AtomicU32>,
+    }
+
+    impl boothcraft_dsp::Effect for Probe {
+        fn specs(&self) -> &[boothcraft_dsp::ParamSpec] {
+            &[]
+        }
+        fn values(&self) -> &[f32] {
+            &[]
+        }
+        fn values_mut(&mut self) -> &mut [f32] {
+            &mut []
+        }
+        fn prepare(&mut self, _: f32, _: usize, _: usize) {}
+        fn reset(&mut self) {}
+        fn process(&mut self, buf: &mut [&mut [f32]]) {
+            self.seen.store(buf.len() as u32, Relaxed);
+        }
+    }
+
+    struct ProbeSource(Arc<AtomicU32>);
+
+    impl boothcraft_dsp::SlotSource for ProbeSource {
+        fn make(
+            &mut self,
+            _: usize,
+            _: &boothcraft_dsp::SlotDesc,
+            _: &boothcraft_dsp::RackConfig,
+        ) -> Result<Box<dyn boothcraft_dsp::Effect>, boothcraft_dsp::SlotError> {
+            Ok(Box::new(Probe {
+                seen: self.0.clone(),
+            }))
+        }
+    }
+
+    #[test]
+    fn preview_rack_sees_document_channels_not_device_channels() {
+        use boothcraft_dsp::{RackConfig, RackDesc};
+        let sh = Shared::new();
+        sh.set_document(ramp_doc(1000, 48_000)); // mono document
+        sh.play();
+        let (mut ctl, link) = crate::rack_channel(48_000, 8);
+        let mut r = Renderer::new(sh.clone());
+        r.attach_rack(link);
+
+        let seen = Arc::new(AtomicU32::new(0));
+        let mut desc = RackDesc::default();
+        desc.slots[0] = boothcraft_dsp::SlotDesc::new("amplify");
+        let cfg = RackConfig {
+            sample_rate: 48_000.0,
+            channels: 1, // the document's channel count
+            max_block: 256,
+        };
+        let (rack, errors) = Rack::build(&desc, &cfg, &mut ProbeSource(seen.clone()));
+        assert!(errors.is_empty());
+        ctl.send(RackMsg::Install(Box::new(rack)));
+        ctl.send(RackMsg::Power(true));
+
+        let mut out = vec![0.0; 8 * 100];
+        r.render(&mut out, 8, 48_000);
+        assert_eq!(
+            seen.load(Relaxed),
+            1,
+            "rack sees the mono document, not 8 outputs"
+        );
+        // A mono document is still heard on every output.
+        for frame in out.as_chunks::<8>().0.iter().skip(1).take(50) {
+            assert!(frame[0] > 0.0 && frame.iter().all(|&x| x == frame[0]));
+        }
+    }
+
+    #[test]
+    fn preview_without_rack_matches_with_neutral_rack() {
+        use boothcraft_dsp::RackDesc;
+        let render = |with_rack: bool| {
+            let sh = Shared::new();
+            sh.set_document(ramp_doc(1000, 48_000));
+            sh.play();
+            let (mut ctl, link) = crate::rack_channel(48_000, 8);
+            let mut r = Renderer::new(sh);
+            r.attach_rack(link);
+            if with_rack {
+                let rack = Rack::new(&RackDesc::default(), 48_000.0, 1, 256);
+                ctl.send(RackMsg::Install(Box::new(rack)));
+                ctl.send(RackMsg::Power(true));
+            }
+            let mut out = vec![0.0; 8 * 300];
+            r.render(&mut out, 8, 48_000);
+            out
+        };
+        assert_eq!(render(false), render(true));
     }
 
     #[test]

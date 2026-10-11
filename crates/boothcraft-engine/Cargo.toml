@@ -14,3 +14,6 @@ cpal = "0.18"
 arc-swap = "1"
 boothcraft-dsp.workspace = true
 rtrb = "0.4"
+
+[dev-dependencies]
+assert_no_alloc = "1"

@@ -1,7 +1,8 @@
 //! The Effects Rack: up to 16 effects in series with input/output gain and a wet/dry mix.
 
 use crate::effect::Effect;
-use crate::param::db_to_gain;
+use crate::param::{db_to_gain, ParamSpec};
+use crate::plugin_ref::{PluginRef, PluginState, SlotId};
 use crate::registry;
 use boothcraft_core::Rope;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,9 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
 pub const SLOTS: usize = 16;
+
+/// `carry` entry meaning "this slot takes nothing from the old rack".
+pub const CARRY_NONE: u8 = u8::MAX;
 
 /// A rack's settings, without any processing state: what the UI edits, presets store, and both
 /// preview and Apply are built from.
@@ -21,11 +25,32 @@ pub struct RackDesc {
     pub mix: f32,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SlotDesc {
+    /// A built-in effect id, or a plugin id such as `vst3:<class id>`.
     pub effect: String,
+    /// Parameter values. For a plugin slot these are only a display cache; `state` is
+    /// authoritative, so never `set_all` after loading a plugin's state.
     pub values: Vec<f32>,
     pub bypass: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<PluginRef>,
+    /// The plugin's own saved state (kept even while the plugin is missing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<PluginState>,
+    /// Instance identity across rebuilds. Not saved; ignored by `==`.
+    #[serde(skip)]
+    pub id: SlotId,
+}
+
+impl PartialEq for SlotDesc {
+    fn eq(&self, o: &SlotDesc) -> bool {
+        self.effect == o.effect
+            && self.values == o.values
+            && self.bypass == o.bypass
+            && self.plugin == o.plugin
+            && self.state == o.state
+    }
 }
 
 impl Default for RackDesc {
@@ -50,17 +75,130 @@ impl RackDesc {
     pub fn is_empty(&self) -> bool {
         self.slots.iter().all(Option::is_none)
     }
+
+    /// Whether any slot is a hosted plugin.
+    pub fn has_plugins(&self) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|s| registry::is_plugin_id(&s.effect))
+    }
 }
 
 impl SlotDesc {
+    /// A built-in real-time effect at its defaults.
     pub fn new(effect_id: &str) -> Option<SlotDesc> {
-        let e = registry::create(effect_id)?;
+        if !registry::info(effect_id)?.is_realtime() {
+            return None;
+        }
         Some(SlotDesc {
             effect: effect_id.to_string(),
-            values: e.values().to_vec(),
+            values: registry::defaults(effect_id)?.to_vec(),
             bypass: false,
+            plugin: None,
+            state: None,
+            id: SlotId::fresh(),
         })
     }
+
+    /// A hosted plugin slot; `values` are the plugin's current parameter values for display.
+    pub fn for_plugin(plugin: PluginRef, values: Vec<f32>, state: Option<PluginState>) -> SlotDesc {
+        SlotDesc {
+            effect: plugin.effect_id(),
+            values,
+            bypass: false,
+            plugin: Some(plugin),
+            state,
+            id: SlotId::fresh(),
+        }
+    }
+}
+
+/// Everything a rack and its effects are prepared for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RackConfig {
+    pub sample_rate: f32,
+    pub channels: usize,
+    pub max_block: usize,
+}
+
+/// Why a slot is not in the built rack. The slot passes audio through.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SlotError {
+    /// Not a built-in effect and not a plugin id.
+    Unknown(String),
+    /// A plugin that is not installed (or was blocked).
+    Missing(String),
+    /// A plugin still instantiating; it will be picked up by a later rebuild.
+    NotReady,
+    /// The plugin refused to load, activate or restore its state.
+    Failed(String),
+    /// The plugin does not support the requested sample rate.
+    UnsupportedRate(f32),
+}
+
+impl std::fmt::Display for SlotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SlotError::Unknown(id) => write!(f, "unknown effect {id}"),
+            SlotError::Missing(id) => write!(f, "plugin {id} is not installed"),
+            SlotError::NotReady => write!(f, "plugin is still loading"),
+            SlotError::Failed(why) => write!(f, "plugin failed: {why}"),
+            SlotError::UnsupportedRate(r) => write!(f, "plugin does not support {r} Hz"),
+        }
+    }
+}
+
+impl std::error::Error for SlotError {}
+
+/// Where a rack gets each slot's effect from. `dsp` knows only the built-ins; the plugin host
+/// supplies another source. Effects come back prepared and reset, with parameters applied.
+pub trait SlotSource {
+    fn make(
+        &mut self,
+        index: usize,
+        slot: &SlotDesc,
+        cfg: &RackConfig,
+    ) -> Result<Box<dyn Effect>, SlotError>;
+}
+
+/// The built-in effects.
+pub struct BuiltinSource;
+
+impl SlotSource for BuiltinSource {
+    fn make(
+        &mut self,
+        _index: usize,
+        slot: &SlotDesc,
+        cfg: &RackConfig,
+    ) -> Result<Box<dyn Effect>, SlotError> {
+        let mut effect = registry::create(&slot.effect)
+            .ok_or_else(|| SlotError::Unknown(slot.effect.clone()))?;
+        effect.set_all(&slot.values);
+        effect.prepare(cfg.sample_rate, cfg.channels, cfg.max_block);
+        effect.reset();
+        Ok(effect)
+    }
+}
+
+/// An effect with no parameters that passes audio through. Stands in for a slot whose live
+/// instance [`Rack::adopt`] will move in from the previous rack. Zero-sized, so boxing it does
+/// not allocate.
+pub struct Carried;
+
+impl Effect for Carried {
+    fn specs(&self) -> &[ParamSpec] {
+        &[]
+    }
+    fn values(&self) -> &[f32] {
+        &[]
+    }
+    fn values_mut(&mut self) -> &mut [f32] {
+        &mut []
+    }
+    fn prepare(&mut self, _: f32, _: usize, _: usize) {}
+    fn reset(&mut self) {}
+    fn process(&mut self, _: &mut [&mut [f32]]) {}
 }
 
 struct Slot {
@@ -82,31 +220,71 @@ pub struct Rack {
 
 impl Rack {
     pub fn new(desc: &RackDesc, sample_rate: f32, channels: usize, max_block: usize) -> Rack {
-        let channels = channels.max(1);
+        let cfg = RackConfig {
+            sample_rate,
+            channels,
+            max_block,
+        };
+        Rack::build(desc, &cfg, &mut BuiltinSource).0
+    }
+
+    /// Build a rack, asking `source` for each slot's effect. Slots the source cannot supply are
+    /// left out (they pass audio through) and reported, so callers can refuse to proceed or show
+    /// why, rather than silently skipping them.
+    pub fn build(
+        desc: &RackDesc,
+        cfg: &RackConfig,
+        source: &mut dyn SlotSource,
+    ) -> (Rack, Vec<(usize, SlotError)>) {
+        let channels = cfg.channels.max(1);
+        let cfg = RackConfig { channels, ..*cfg };
+        let mut errors = Vec::new();
         let slots = desc
             .slots
             .iter()
-            .map(|s| {
+            .enumerate()
+            .map(|(i, s)| {
                 let s = s.as_ref()?;
-                let mut effect = registry::create(&s.effect)?;
-                effect.set_all(&s.values);
-                effect.prepare(sample_rate, channels, max_block);
-                effect.reset();
-                Some(Slot {
-                    effect,
-                    bypass: s.bypass,
-                })
+                match source.make(i, s, &cfg) {
+                    Ok(effect) => Some(Slot {
+                        effect,
+                        bypass: s.bypass,
+                    }),
+                    Err(e) => {
+                        errors.push((i, e));
+                        None
+                    }
+                }
             })
             .collect();
-        Rack {
+        let rack = Rack {
             slots,
             input_gain: db_to_gain(desc.input_gain_db),
             output_gain: db_to_gain(desc.output_gain_db),
             mix: desc.mix.clamp(0.0, 1.0),
             channels,
-            max_block,
-            dry: vec![vec![0.0; max_block]; channels],
-            planar: vec![vec![0.0; max_block]; channels],
+            max_block: cfg.max_block,
+            dry: vec![vec![0.0; cfg.max_block]; channels],
+            planar: vec![vec![0.0; cfg.max_block]; channels],
+        };
+        (rack, errors)
+    }
+
+    /// Move live effects from `old` into this rack: slot `i` takes `old`'s slot `carry[i]` (or
+    /// keeps its own when `CARRY_NONE`). Only pointers move, so this is safe on the audio thread.
+    /// The slots here that receive a carried effect should be [`Carried`] placeholders (or any
+    /// effect); whatever they held ends up in `old`, which the caller then retires.
+    pub fn adopt(&mut self, old: &mut Rack, carry: &[u8; SLOTS]) {
+        for (i, &from) in carry.iter().enumerate() {
+            let from = from as usize;
+            if from == CARRY_NONE as usize {
+                continue;
+            }
+            if let (Some(Some(mine)), Some(Some(theirs))) =
+                (self.slots.get_mut(i), old.slots.get_mut(from))
+            {
+                std::mem::swap(&mut mine.effect, &mut theirs.effect);
+            }
         }
     }
 
@@ -142,10 +320,38 @@ impl Rack {
             .sum()
     }
 
+    /// Longest tail of the active effects, in frames.
+    pub fn tail(&self) -> usize {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|s| !s.bypass)
+            .map(|s| s.effect.tail())
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn reset(&mut self) {
         for s in self.slots.iter_mut().flatten() {
             s.effect.reset();
         }
+    }
+
+    /// The effect in `slot`, for callers (the plugin host) that need to inspect or retire it.
+    pub fn effect_mut(&mut self, slot: usize) -> Option<&mut dyn Effect> {
+        match self.slots.get_mut(slot) {
+            Some(Some(s)) => Some(s.effect.as_mut()),
+            _ => None,
+        }
+    }
+
+    /// Take every effect out of the rack (for the host to tear down on the right thread).
+    pub fn into_effects(self) -> Vec<(usize, Box<dyn Effect>)> {
+        self.slots
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, s)| Some((i, s?.effect)))
+            .collect()
     }
 
     /// Process planar audio. Longer buffers are processed in `max_block` pieces.
@@ -162,6 +368,23 @@ impl Rack {
                 ch[at..at + len].copy_from_slice(&self.planar[c][..len]);
             }
             at += len;
+        }
+    }
+
+    /// Process the first `len` frames of planar `Vec` channels in place (the engine's per-channel
+    /// scratch buffers), without building a slice array.
+    pub fn process_vecs(&mut self, bufs: &mut [Vec<f32>], len: usize) {
+        let mut at = 0;
+        while at < len {
+            let n = (len - at).min(self.max_block);
+            for (c, ch) in bufs.iter().enumerate().take(self.channels) {
+                self.planar[c][..n].copy_from_slice(&ch[at..at + n]);
+            }
+            self.process_planar(n);
+            for (c, ch) in bufs.iter_mut().enumerate().take(self.channels) {
+                ch[at..at + n].copy_from_slice(&self.planar[c][..n]);
+            }
+            at += n;
         }
     }
 
@@ -197,19 +420,23 @@ impl Rack {
                 d[..len].copy_from_slice(&p[..len]);
             }
         }
-        // Up to 8 channels without allocating: borrow each channel's slice into a stack array.
-        let mut slices: [&mut [f32]; 8] = Default::default();
-        let n = self.planar.len().min(8);
-        for (dst, ch) in slices.iter_mut().zip(self.planar.iter_mut()) {
-            *dst = &mut ch[..len];
-        }
-        for slot in self.slots.iter_mut().flatten() {
-            if !slot.bypass {
-                slot.effect.process(&mut slices[..n]);
+        {
+            // Effects see up to 8 channels (any more stay dry), borrowed into a stack array so
+            // nothing allocates.
+            let mut slices: [&mut [f32]; 8] = Default::default();
+            let n = self.planar.len().min(8);
+            for (dst, ch) in slices.iter_mut().zip(self.planar.iter_mut()) {
+                *dst = &mut ch[..len];
+            }
+            for slot in self.slots.iter_mut().flatten() {
+                if !slot.bypass {
+                    slot.effect.process(&mut slices[..n]);
+                }
             }
         }
-        for (c, ch) in slices[..n].iter_mut().enumerate() {
-            for (i, x) in ch.iter_mut().enumerate() {
+        // Mix and output gain apply to every channel, including those past the effects' 8.
+        for (c, ch) in self.planar.iter_mut().enumerate() {
+            for (i, x) in ch[..len].iter_mut().enumerate() {
                 let wet = *x;
                 *x = if mix < 1.0 {
                     (self.dry[c][i] * (1.0 - mix) + wet * mix) * og
@@ -231,9 +458,23 @@ pub fn render_offline(
     progress: &AtomicU32,
     cancel: &AtomicBool,
 ) -> bool {
-    const BLOCK: usize = 4096;
+    let mut rack = Rack::new(desc, sample_rate, chans.len(), OFFLINE_BLOCK);
+    render_offline_with(&mut rack, chans, progress, cancel)
+}
+
+/// Block size for offline rendering; plugin racks are built with this as `max_block`.
+pub const OFFLINE_BLOCK: usize = 4096;
+
+/// [`render_offline`] with a rack the caller built (e.g. from plugins). The rack's latency is
+/// read here, so it must already be primed.
+pub fn render_offline_with(
+    rack: &mut Rack,
+    chans: &mut [Vec<f32>],
+    progress: &AtomicU32,
+    cancel: &AtomicBool,
+) -> bool {
+    const BLOCK: usize = OFFLINE_BLOCK;
     let n = chans.first().map_or(0, Vec::len);
-    let mut rack = Rack::new(desc, sample_rate, chans.len(), BLOCK);
     let latency = rack.latency();
     let total = n + latency;
     let mut block: Vec<Vec<f32>> = vec![vec![0.0; BLOCK]; chans.len()];
@@ -276,9 +517,21 @@ pub fn render_rope(
     progress: &AtomicU32,
     cancel: &AtomicBool,
 ) -> Option<Vec<Rope>> {
-    const BLOCK: usize = 4096;
+    let mut rack = Rack::new(desc, sample_rate, channels.len(), OFFLINE_BLOCK);
+    render_rope_with(&mut rack, channels, range, progress, cancel)
+}
+
+/// [`render_rope`] with a rack the caller built. The rack's latency is read here, so it must
+/// already be primed. Its channel count must equal `channels.len()`.
+pub fn render_rope_with(
+    rack: &mut Rack,
+    channels: &[Rope],
+    range: Range<usize>,
+    progress: &AtomicU32,
+    cancel: &AtomicBool,
+) -> Option<Vec<Rope>> {
+    const BLOCK: usize = OFFLINE_BLOCK;
     let n = range.end.saturating_sub(range.start);
-    let mut rack = Rack::new(desc, sample_rate, channels.len(), BLOCK);
     let latency = rack.latency();
     let total = n + latency;
     let mut block: Vec<Vec<f32>> = vec![vec![0.0; BLOCK]; channels.len()];
@@ -319,6 +572,10 @@ fn read_clamped(rope: &Rope, start: usize, buf: &mut [f32], hard_end: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert_no_alloc::AllocDisabler;
+
+    #[global_allocator]
+    static ALLOC: AllocDisabler = AllocDisabler;
 
     fn amp_rack(db: f32) -> RackDesc {
         let mut d = RackDesc::single("amplify").unwrap();
@@ -405,15 +662,92 @@ mod tests {
     }
 
     #[test]
-    fn unknown_effects_are_skipped() {
+    fn unknown_effects_are_skipped_and_reported() {
         let mut d = RackDesc::default();
         d.slots[3] = Some(SlotDesc {
             effect: "no-such-effect".into(),
             values: vec![],
             bypass: false,
+            plugin: None,
+            state: None,
+            id: SlotId::fresh(),
         });
         let input = vec![0.5f32; 100];
         assert_eq!(render(&d, &input), input);
+        let cfg = RackConfig {
+            sample_rate: 48_000.0,
+            channels: 1,
+            max_block: 64,
+        };
+        let (_, errors) = Rack::build(&d, &cfg, &mut BuiltinSource);
+        assert_eq!(
+            errors,
+            vec![(3, SlotError::Unknown("no-such-effect".into()))]
+        );
+    }
+
+    #[test]
+    fn old_rack_files_load_and_plugin_state_round_trips() {
+        // The format before plugin support: no plugin/state fields.
+        let old = r#"{"slots":[{"effect":"amplify","values":[6.0],"bypass":false},null],
+                      "input_gain_db":0.0,"output_gain_db":0.0,"mix":1.0}"#;
+        let d: RackDesc = serde_json::from_str(old).unwrap();
+        assert_eq!(d.slots[0].as_ref().unwrap().plugin, None);
+
+        let state: Vec<u8> = (0..=255).rev().collect();
+        let plugin = PluginRef {
+            format: "vst3".into(),
+            uid: "ABCD".into(),
+            name: "Thing".into(),
+            vendor: "Acme".into(),
+        };
+        let mut d = RackDesc::default();
+        d.slots[1] = Some(SlotDesc::for_plugin(
+            plugin,
+            vec![0.5],
+            Some(PluginState(state.clone())),
+        ));
+        let back: RackDesc = serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
+        assert_eq!(back, d);
+        assert_eq!(
+            back.slots[1].as_ref().unwrap().state.as_ref().unwrap().0,
+            state
+        );
+        assert!(d.has_plugins());
+    }
+
+    #[test]
+    fn adopt_moves_live_effects_without_allocating() {
+        let mut old = Rack::new(&amp_rack(20.0 * 2f32.log10()), 48_000.0, 1, 64);
+        // New rack: slot 0 is a carried placeholder, slot 1 a fresh amplify at 0 dB.
+        let mut desc = RackDesc::default();
+        desc.slots[0] = Some(SlotDesc::new("amplify").unwrap());
+        desc.slots[1] = Some(SlotDesc::new("amplify").unwrap());
+        let mut new = Rack::new(&desc, 48_000.0, 1, 64);
+        let mut carry = [CARRY_NONE; SLOTS];
+        carry[0] = 0;
+        assert_no_alloc::assert_no_alloc(|| new.adopt(&mut old, &carry));
+        let mut buf = vec![0.25f32; 64];
+        new.process(&mut [&mut buf[..]]);
+        assert!(
+            (buf[63] - 0.5).abs() < 1e-5,
+            "carried effect (+6 dB) must be live"
+        );
+    }
+
+    #[test]
+    fn channels_past_eight_get_gain_and_mix() {
+        let d = RackDesc {
+            output_gain_db: -6.0,
+            ..RackDesc::default()
+        };
+        let mut r = Rack::new(&d, 48_000.0, 10, 32);
+        let mut bufs: Vec<Vec<f32>> = vec![vec![1.0; 32]; 10];
+        let mut slices: Vec<&mut [f32]> = bufs.iter_mut().map(|b| &mut b[..]).collect();
+        r.process(&mut slices);
+        for (c, b) in bufs.iter().enumerate() {
+            assert!((b[5] - db_to_gain(-6.0)).abs() < 1e-6, "channel {c}");
+        }
     }
 
     #[test]

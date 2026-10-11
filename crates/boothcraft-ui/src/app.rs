@@ -575,6 +575,9 @@ impl State {
     /// Per-frame effect plumbing: the open effect dialog and any Apply in progress.
     fn effects_frame(&mut self, ctx: &egui::Context) {
         self.preview.tick();
+        if let Some(f) = self.files.get(self.active) {
+            self.preview.set_doc_channels(f.doc().channel_count());
+        }
         self.loudness.tick();
         if self.apply_job.is_none() {
             if let Some((i, label, kind)) = self.apply_queue.pop_front() {

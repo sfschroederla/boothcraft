@@ -2,6 +2,9 @@
 
 use crate::effect::{Effect, OfflineEffect};
 use crate::effects;
+use crate::param::ParamSpec;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Category {
@@ -195,5 +198,70 @@ pub fn create_offline(id: &str) -> Option<Box<dyn OfflineEffect>> {
     match info(id)?.kind {
         Kind::Offline(make) => Some(make()),
         Kind::Realtime(_) => None,
+    }
+}
+
+/// Id prefixes of hosted plugin effects (`vst3:<class id>`, `au:<type-subtype-manufacturer>`).
+/// Plugin ids are never built in; `dsp` only recognises them so it can tell "missing plugin"
+/// from "unknown effect".
+pub const PLUGIN_PREFIXES: &[&str] = &["vst3:", "au:", "clap:"];
+
+pub fn is_plugin_id(id: &str) -> bool {
+    PLUGIN_PREFIXES.iter().any(|p| id.starts_with(p))
+}
+
+struct Cached {
+    specs: &'static [ParamSpec],
+    defaults: Vec<f32>,
+}
+
+/// Built-in effects' specs and defaults, computed once. Lets the UI read parameter lists every
+/// frame without constructing an effect.
+fn cache() -> &'static HashMap<&'static str, Cached> {
+    static CACHE: OnceLock<HashMap<&'static str, Cached>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        EFFECTS
+            .iter()
+            .map(|info| {
+                let (specs, defaults): (&[ParamSpec], Vec<f32>) = match &info.kind {
+                    Kind::Realtime(make) => {
+                        let fx = make();
+                        (fx.specs().to_vec().leak(), fx.values().to_vec())
+                    }
+                    Kind::Offline(make) => {
+                        let fx = make();
+                        (fx.specs(), fx.values().to_vec())
+                    }
+                };
+                (info.id, Cached { specs, defaults })
+            })
+            .collect()
+    })
+}
+
+/// Parameter list of a built-in effect (real-time or offline).
+pub fn specs(id: &str) -> Option<&'static [ParamSpec]> {
+    cache().get(id).map(|c| c.specs)
+}
+
+/// Default parameter values of a built-in effect.
+pub fn defaults(id: &str) -> Option<&'static [f32]> {
+    cache().get(id).map(|c| c.defaults.as_slice())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_specs_match_instances() {
+        for info in EFFECTS {
+            let specs = specs(info.id).unwrap();
+            let defaults = defaults(info.id).unwrap();
+            assert_eq!(specs.len(), defaults.len(), "{}", info.id);
+        }
+        assert!(specs("nope").is_none());
+        assert!(is_plugin_id("vst3:ABCD") && is_plugin_id("au:aufx-dely-appl"));
+        assert!(!is_plugin_id("amplify"));
     }
 }

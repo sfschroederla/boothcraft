@@ -3,6 +3,7 @@
 //! Effect presets key values by parameter id, so they survive parameters being added or reordered.
 
 use crate::param::ParamSpec;
+use crate::plugin_ref::{PluginRef, PluginState};
 use crate::rack::RackDesc;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -12,6 +13,11 @@ use std::path::{Path, PathBuf};
 pub struct Preset {
     pub name: String,
     pub values: BTreeMap<String, f32>,
+    /// Plugin presets: the plugin's own saved state, which is authoritative over `values`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<PluginState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<PluginRef>,
 }
 
 impl Preset {
@@ -23,6 +29,8 @@ impl Preset {
                 .zip(values)
                 .map(|(s, v)| (s.id.to_string(), *v))
                 .collect(),
+            state: None,
+            plugin: None,
         }
     }
 
@@ -45,7 +53,9 @@ pub fn root() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "Boothcraft").map(|d| d.config_dir().join("presets"))
 }
 
-fn safe_name(name: &str) -> String {
+/// A name safe as a file or folder name on every platform. Also maps effect ids such as
+/// `vst3:ABCD`, whose colon is invalid in Windows paths.
+pub fn dir_for(name: &str) -> String {
     name.chars()
         .map(|c| {
             if c.is_alphanumeric() || " -_".contains(c) {
@@ -59,7 +69,7 @@ fn safe_name(name: &str) -> String {
 
 /// Presets saved for `effect_id` under `dir`, sorted by name.
 pub fn load(dir: &Path, effect_id: &str) -> Vec<Preset> {
-    let mut out: Vec<Preset> = std::fs::read_dir(dir.join(effect_id))
+    let mut out: Vec<Preset> = std::fs::read_dir(dir.join(dir_for(effect_id)))
         .into_iter()
         .flatten()
         .flatten()
@@ -70,16 +80,16 @@ pub fn load(dir: &Path, effect_id: &str) -> Vec<Preset> {
 }
 
 pub fn save(dir: &Path, effect_id: &str, preset: &Preset) -> std::io::Result<()> {
-    let d = dir.join(effect_id);
+    let d = dir.join(dir_for(effect_id));
     std::fs::create_dir_all(&d)?;
     let json = serde_json::to_vec_pretty(preset).map_err(std::io::Error::other)?;
-    std::fs::write(d.join(format!("{}.json", safe_name(&preset.name))), json)
+    std::fs::write(d.join(format!("{}.json", dir_for(&preset.name))), json)
 }
 
 pub fn delete(dir: &Path, effect_id: &str, name: &str) -> std::io::Result<()> {
     std::fs::remove_file(
-        dir.join(effect_id)
-            .join(format!("{}.json", safe_name(name))),
+        dir.join(dir_for(effect_id))
+            .join(format!("{}.json", dir_for(name))),
     )
 }
 
@@ -114,6 +124,18 @@ mod tests {
         assert_eq!(loaded[0].values_for(&SPECS), vec![5.0, -2.0]);
         delete(&dir, "amplify", &p.name).unwrap();
         assert!(load(&dir, "amplify").is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn plugin_ids_get_portable_folder_names() {
+        assert_eq!(dir_for("vst3:ABCD"), "vst3_ABCD");
+        let dir = std::env::temp_dir().join(format!("bc-presets-plug-{}", std::process::id()));
+        let mut p = Preset::capture("Warm", &SPECS, &[1.0, 2.0]);
+        p.state = Some(PluginState(vec![1, 2, 3]));
+        save(&dir, "vst3:ABCD", &p).unwrap();
+        assert_eq!(load(&dir, "vst3:ABCD"), vec![p]);
+        assert!(dir.join("vst3_ABCD").is_dir());
         std::fs::remove_dir_all(&dir).ok();
     }
 

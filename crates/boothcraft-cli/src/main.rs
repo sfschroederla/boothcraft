@@ -82,12 +82,7 @@ fn apply_effect(
     use std::sync::atomic::{AtomicBool, AtomicU32};
     let info = registry::info(id)
         .with_context(|| format!("unknown effect {id:?}; see `boothcraft-cli effects`"))?;
-    let specs = match registry::create(id) {
-        Some(fx) => fx.specs(),
-        None => registry::create_offline(id)
-            .map(|fx| fx.specs())
-            .unwrap_or(&[]),
-    };
+    let specs = registry::specs(id).unwrap_or(&[]);
     let mut values: Vec<f32> = specs.iter().map(|s| s.default).collect();
     for (k, v) in params {
         let i = specs
@@ -102,12 +97,15 @@ fn apply_effect(
     if info.is_realtime() {
         let mut desc = boothcraft_dsp::RackDesc::single(id).context("effect")?;
         desc.slots[0].as_mut().context("slot")?.values = values;
-        boothcraft_dsp::rack::render_offline(
-            &desc,
-            &mut chans,
-            rate,
-            &AtomicU32::new(0),
-            &AtomicBool::new(false),
+        anyhow::ensure!(
+            boothcraft_dsp::rack::render_offline(
+                &desc,
+                &mut chans,
+                rate,
+                &AtomicU32::new(0),
+                &AtomicBool::new(false),
+            ),
+            "rendering {id} did not complete"
         );
     } else {
         let mut fx = registry::create_offline(id).context("effect")?;
@@ -126,12 +124,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Effects => {
             for info in boothcraft_dsp::registry::EFFECTS {
-                let specs = match boothcraft_dsp::registry::create(info.id) {
-                    Some(fx) => fx.specs(),
-                    None => boothcraft_dsp::registry::create_offline(info.id)
-                        .map(|fx| fx.specs())
-                        .unwrap_or(&[]),
-                };
+                let specs = boothcraft_dsp::registry::specs(info.id).unwrap_or(&[]);
                 let kind = if info.is_realtime() { "" } else { " (offline)" };
                 println!(
                     "{} - {}{} [{}]",
