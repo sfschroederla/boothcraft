@@ -18,6 +18,8 @@ pub struct Shared {
     loop_start: AtomicU64,
     loop_end: AtomicU64,
     peaks: [AtomicU32; MAX_METERS],
+    /// Stereo correlation of the last rendered block, as f32 bits; NaN when silent or not playing.
+    phase: AtomicU32,
 }
 
 impl Shared {
@@ -31,6 +33,7 @@ impl Shared {
             loop_start: AtomicU64::new(0),
             loop_end: AtomicU64::new(0),
             peaks: Default::default(),
+            phase: AtomicU32::new(f32::NAN.to_bits()),
         })
     }
 
@@ -72,6 +75,13 @@ impl Shared {
         self.looping.store(enabled, Relaxed);
     }
 
+    /// Phase correlation between the first two output channels, from -1 (out of phase) to +1
+    /// (identical), or `None` when nothing is playing.
+    pub fn phase_correlation(&self) -> Option<f32> {
+        let v = f32::from_bits(self.phase.load(Relaxed));
+        (!v.is_nan()).then_some(v)
+    }
+
     /// Peak since the last call, per output channel, resetting the meters.
     pub fn take_peaks(&self, out: &mut [f32]) {
         for (o, p) in out.iter_mut().zip(&self.peaks) {
@@ -99,6 +109,7 @@ impl Renderer {
     pub fn render(&mut self, out: &mut [f32], out_channels: usize, out_rate: u32) {
         out.fill(0.0);
         let s = &*self.shared;
+        s.phase.store(f32::NAN.to_bits(), Relaxed);
         let seek = s.pending_seek.swap(NO_SEEK, Relaxed);
         let mut pos = if seek >= 0 { seek as f64 } else { s.position() };
         let guard = s.doc.load();
@@ -179,6 +190,19 @@ impl Renderer {
                 break;
             }
         }
+        if out_channels >= 2 {
+            let (mut ll, mut rr, mut lr) = (0f64, 0f64, 0f64);
+            for frame in out[..produced * out_channels].chunks_exact(out_channels) {
+                let (l, r) = (frame[0] as f64, frame[1] as f64);
+                ll += l * l;
+                rr += r * r;
+                lr += l * r;
+            }
+            if ll > 1e-12 && rr > 1e-12 {
+                s.phase
+                    .store(((lr / (ll * rr).sqrt()) as f32).to_bits(), Relaxed);
+            }
+        }
         for (p, v) in s.peaks.iter().zip(peaks) {
             let prev = f32::from_bits(p.load(Relaxed));
             p.store(prev.max(v).to_bits(), Relaxed);
@@ -257,6 +281,30 @@ mod tests {
             (sh.position() - expect).abs() < 2.0,
             "position {}",
             sh.position()
+        );
+    }
+
+    #[test]
+    fn phase_correlation_tracks_polarity() {
+        let rate = 48_000;
+        let sine: Vec<f32> = (0..2000).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
+        let inverted: Vec<f32> = sine.iter().map(|x| -x).collect();
+        let play = |chans: Vec<Vec<f32>>| {
+            let sh = Shared::new();
+            let ropes = chans.iter().map(|c| Rope::from_samples(c)).collect();
+            sh.set_document(Arc::new(Document::new(rate, ropes)));
+            assert_eq!(sh.phase_correlation(), None, "no reading before playing");
+            sh.play();
+            let mut r = Renderer::new(sh.clone());
+            let mut out = vec![0.0; 1000 * 2];
+            r.render(&mut out, 2, rate);
+            sh.phase_correlation().unwrap()
+        };
+        assert!((play(vec![sine.clone(), sine.clone()]) - 1.0).abs() < 1e-4);
+        assert!((play(vec![sine.clone(), inverted]) + 1.0).abs() < 1e-4);
+        assert!(
+            (play(vec![sine]) - 1.0).abs() < 1e-4,
+            "mono plays to both sides"
         );
     }
 

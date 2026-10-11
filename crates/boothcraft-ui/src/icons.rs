@@ -1,7 +1,10 @@
 //! Transport and zoom icons drawn as vector shapes, so they render identically on every platform
 //! without depending on font glyph coverage.
 
-use egui::{pos2, vec2, Color32, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, WidgetInfo, WidgetType};
+use egui::{
+    pos2, vec2, Color32, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, WidgetInfo,
+    WidgetType,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
@@ -38,8 +41,17 @@ pub fn button(ui: &mut Ui, icon: Icon, selected: bool, tooltip: &str) -> Respons
         if selected || resp.hovered() {
             painter.rect_filled(rect, v.corner_radius, v.weak_bg_fill);
         }
-        let color = if icon == Icon::Record && enabled { RECORD_RED } else { v.fg_stroke.color };
-        paint(painter, icon, Rect::from_center_size(rect.center(), vec2(16.0, 16.0)), color);
+        let color = if icon == Icon::Record && enabled {
+            RECORD_RED
+        } else {
+            v.fg_stroke.color
+        };
+        paint(
+            painter,
+            icon,
+            Rect::from_center_size(rect.center(), vec2(16.0, 16.0)),
+            color,
+        );
     }
     resp.on_hover_text(tooltip)
 }
@@ -48,36 +60,66 @@ pub fn button(ui: &mut Ui, icon: Icon, selected: bool, tooltip: &str) -> Respons
 pub fn paint(p: &egui::Painter, icon: Icon, r: Rect, color: Color32) {
     let (c, s) = (r.center(), r.width().min(r.height()) / 2.0);
     let fill = |points: Vec<Pos2>| p.add(Shape::convex_polygon(points, color, Stroke::NONE));
-    let bar = |x0: f32, x1: f32| p.rect_filled(Rect::from_min_max(pos2(x0, c.y - s), pos2(x1, c.y + s)), 0.0, color);
+    let bar = |x0: f32, x1: f32| {
+        p.rect_filled(
+            Rect::from_min_max(pos2(x0, c.y - s), pos2(x1, c.y + s)),
+            0.0,
+            color,
+        )
+    };
     let line = Stroke::new(1.8, color);
     let thin = Stroke::new(1.3, color);
     match icon {
         Icon::Play => {
-            fill(vec![pos2(c.x - s * 0.75, c.y - s), pos2(c.x + s, c.y), pos2(c.x - s * 0.75, c.y + s)]);
+            fill(vec![
+                pos2(c.x - s * 0.75, c.y - s),
+                pos2(c.x + s, c.y),
+                pos2(c.x - s * 0.75, c.y + s),
+            ]);
         }
         Icon::Pause => {
             bar(c.x - s * 0.8, c.x - s * 0.2);
             bar(c.x + s * 0.2, c.x + s * 0.8);
         }
         Icon::Stop => {
-            p.rect_filled(Rect::from_center_size(c, vec2(s * 1.7, s * 1.7)), 1.0, color);
+            p.rect_filled(
+                Rect::from_center_size(c, vec2(s * 1.7, s * 1.7)),
+                1.0,
+                color,
+            );
         }
         Icon::ToStart => {
             bar(c.x - s, c.x - s * 0.6);
-            fill(vec![pos2(c.x + s, c.y - s), pos2(c.x - s * 0.5, c.y), pos2(c.x + s, c.y + s)]);
+            fill(vec![
+                pos2(c.x + s, c.y - s),
+                pos2(c.x - s * 0.5, c.y),
+                pos2(c.x + s, c.y + s),
+            ]);
         }
         Icon::ToEnd => {
             bar(c.x + s * 0.6, c.x + s);
-            fill(vec![pos2(c.x - s, c.y - s), pos2(c.x + s * 0.5, c.y), pos2(c.x - s, c.y + s)]);
+            fill(vec![
+                pos2(c.x - s, c.y - s),
+                pos2(c.x + s * 0.5, c.y),
+                pos2(c.x - s, c.y + s),
+            ]);
         }
         Icon::Rewind => {
             for dx in [0.0, s] {
-                fill(vec![pos2(c.x + dx, c.y - s * 0.8), pos2(c.x + dx - s, c.y), pos2(c.x + dx, c.y + s * 0.8)]);
+                fill(vec![
+                    pos2(c.x + dx, c.y - s * 0.8),
+                    pos2(c.x + dx - s, c.y),
+                    pos2(c.x + dx, c.y + s * 0.8),
+                ]);
             }
         }
         Icon::FastForward => {
             for dx in [0.0, -s] {
-                fill(vec![pos2(c.x + dx, c.y - s * 0.8), pos2(c.x + dx + s, c.y), pos2(c.x + dx, c.y + s * 0.8)]);
+                fill(vec![
+                    pos2(c.x + dx, c.y - s * 0.8),
+                    pos2(c.x + dx + s, c.y),
+                    pos2(c.x + dx, c.y + s * 0.8),
+                ]);
             }
         }
         Icon::Record => {
@@ -88,26 +130,55 @@ pub fn paint(p: &egui::Painter, icon: Icon, r: Rect, color: Color32) {
             p.rect_stroke(body, 3.0, line, StrokeKind::Middle);
             // Arrowheads on the top and bottom edges, pointing in opposite directions.
             let (top, bottom) = (body.top(), body.bottom());
-            fill(vec![pos2(c.x + s * 0.1, top - s * 0.4), pos2(c.x + s * 0.1, top + s * 0.4), pos2(c.x + s * 0.7, top)]);
-            fill(vec![pos2(c.x - s * 0.1, bottom - s * 0.4), pos2(c.x - s * 0.1, bottom + s * 0.4), pos2(c.x - s * 0.7, bottom)]);
+            fill(vec![
+                pos2(c.x + s * 0.1, top - s * 0.4),
+                pos2(c.x + s * 0.1, top + s * 0.4),
+                pos2(c.x + s * 0.7, top),
+            ]);
+            fill(vec![
+                pos2(c.x - s * 0.1, bottom - s * 0.4),
+                pos2(c.x - s * 0.1, bottom + s * 0.4),
+                pos2(c.x - s * 0.7, bottom),
+            ]);
         }
         Icon::Follow => {
             // An arrow chasing a playhead line.
-            p.line_segment([pos2(c.x + s * 0.8, c.y - s), pos2(c.x + s * 0.8, c.y + s)], line);
+            p.line_segment(
+                [pos2(c.x + s * 0.8, c.y - s), pos2(c.x + s * 0.8, c.y + s)],
+                line,
+            );
             p.line_segment([pos2(c.x - s, c.y), pos2(c.x + s * 0.2, c.y)], line);
-            fill(vec![pos2(c.x - s * 0.1, c.y - s * 0.6), pos2(c.x + s * 0.5, c.y), pos2(c.x - s * 0.1, c.y + s * 0.6)]);
+            fill(vec![
+                pos2(c.x - s * 0.1, c.y - s * 0.6),
+                pos2(c.x + s * 0.5, c.y),
+                pos2(c.x - s * 0.1, c.y + s * 0.6),
+            ]);
         }
         Icon::AmpReset => {
-            p.text(c, egui::Align2::CENTER_CENTER, "1:1", egui::FontId::proportional(s * 1.3), color);
+            p.text(
+                c,
+                egui::Align2::CENTER_CENTER,
+                "1:1",
+                egui::FontId::proportional(s * 1.3),
+                color,
+            );
         }
-        Icon::AmpZoomIn | Icon::AmpZoomOut | Icon::TimeZoomIn | Icon::TimeZoomOut | Icon::ZoomSelection | Icon::ZoomFull => {
+        Icon::AmpZoomIn
+        | Icon::AmpZoomOut
+        | Icon::TimeZoomIn
+        | Icon::TimeZoomOut
+        | Icon::ZoomSelection
+        | Icon::ZoomFull => {
             // Magnifier in the upper right; amplitude zooms get a vertical double arrow on the left,
             // time zooms a horizontal one along the bottom.
             let lens = pos2(c.x + s * 0.2, c.y - s * 0.25);
             let radius = s * 0.58;
             p.circle_stroke(lens, radius, thin);
             let dir = vec2(1.0, 1.0).normalized();
-            p.line_segment([lens + dir * radius, lens + dir * (radius + s * 0.65)], line);
+            p.line_segment(
+                [lens + dir * radius, lens + dir * (radius + s * 0.65)],
+                line,
+            );
             let reach = s * 0.3;
             let plus = |vertical: bool| {
                 p.line_segment([lens - vec2(reach, 0.0), lens + vec2(reach, 0.0)], thin);
@@ -126,7 +197,10 @@ pub fn paint(p: &egui::Painter, icon: Icon, r: Rect, color: Color32) {
                 _ => {
                     p.line_segment([lens - vec2(reach, 0.0), lens + vec2(reach, 0.0)], thin);
                     for dx in [-reach, reach] {
-                        p.line_segment([lens + vec2(dx, -reach * 0.6), lens + vec2(dx, reach * 0.6)], thin);
+                        p.line_segment(
+                            [lens + vec2(dx, -reach * 0.6), lens + vec2(dx, reach * 0.6)],
+                            thin,
+                        );
                     }
                 }
             }
@@ -136,15 +210,31 @@ pub fn paint(p: &egui::Painter, icon: Icon, r: Rect, color: Color32) {
                     let x = c.x - s * 0.9;
                     let (top, bottom) = (c.y - s, c.y + s * 0.6);
                     p.line_segment([pos2(x, top), pos2(x, bottom)], thin);
-                    fill(vec![pos2(x - arrow_tip, top + arrow_tip * 1.4), pos2(x + arrow_tip, top + arrow_tip * 1.4), pos2(x, top - 0.5)]);
-                    fill(vec![pos2(x - arrow_tip, bottom - arrow_tip * 1.4), pos2(x + arrow_tip, bottom - arrow_tip * 1.4), pos2(x, bottom + 0.5)]);
+                    fill(vec![
+                        pos2(x - arrow_tip, top + arrow_tip * 1.4),
+                        pos2(x + arrow_tip, top + arrow_tip * 1.4),
+                        pos2(x, top - 0.5),
+                    ]);
+                    fill(vec![
+                        pos2(x - arrow_tip, bottom - arrow_tip * 1.4),
+                        pos2(x + arrow_tip, bottom - arrow_tip * 1.4),
+                        pos2(x, bottom + 0.5),
+                    ]);
                 }
                 _ => {
                     let y = c.y + s * 0.85;
                     let (left, right) = (c.x - s, c.x + s * 0.5);
                     p.line_segment([pos2(left, y), pos2(right, y)], thin);
-                    fill(vec![pos2(left + arrow_tip * 1.4, y - arrow_tip), pos2(left + arrow_tip * 1.4, y + arrow_tip), pos2(left - 0.5, y)]);
-                    fill(vec![pos2(right - arrow_tip * 1.4, y - arrow_tip), pos2(right - arrow_tip * 1.4, y + arrow_tip), pos2(right + 0.5, y)]);
+                    fill(vec![
+                        pos2(left + arrow_tip * 1.4, y - arrow_tip),
+                        pos2(left + arrow_tip * 1.4, y + arrow_tip),
+                        pos2(left - 0.5, y),
+                    ]);
+                    fill(vec![
+                        pos2(right - arrow_tip * 1.4, y - arrow_tip),
+                        pos2(right - arrow_tip * 1.4, y + arrow_tip),
+                        pos2(right + 0.5, y),
+                    ]);
                 }
             }
         }
@@ -181,7 +271,7 @@ mod tests {
             rects.windows(2).all(|w| w[0].right() <= w[1].left()),
             "buttons do not overlap"
         );
-        // Each icon contributes shapes beyond its background rect.
+        // Flat buttons draw no background, so every icon must contribute its own shapes.
         assert!(
             out.shapes.len() >= all.len() * 2,
             "got {} shapes",

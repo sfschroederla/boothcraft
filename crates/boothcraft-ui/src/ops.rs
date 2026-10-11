@@ -16,6 +16,8 @@ pub struct OpenFile {
     pub revision: u64,
     /// A frame the waveform should scroll into view on its next draw.
     pub reveal_request: Option<usize>,
+    /// Width in pixels of the waveform area at its last draw, so panels can report the visible range.
+    pub view_width_px: f32,
 }
 
 impl OpenFile {
@@ -34,6 +36,7 @@ impl OpenFile {
             saved_at: 0,
             revision: 0,
             reveal_request: None,
+            view_width_px: 0.0,
         }
     }
 

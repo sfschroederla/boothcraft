@@ -85,8 +85,9 @@ pub struct Gridline {
     pub label: String,
 }
 
-const DB_LEVELS: [f32; 12] = [
-    0.0, -3.0, -6.0, -9.0, -12.0, -18.0, -24.0, -36.0, -48.0, -60.0, -72.0, -96.0,
+const DB_LEVELS: [f32; 22] = [
+    0.0, -0.5, -1.0, -1.5, -2.0, -2.5, -3.0, -4.0, -5.0, -6.0, -7.0, -9.0, -12.0, -15.0, -18.0,
+    -24.0, -30.0, -36.0, -48.0, -60.0, -72.0, -96.0,
 ];
 
 /// Gridlines for a lane whose half-height is `half_px` at amplitude zoom `zoom`.
@@ -105,11 +106,7 @@ pub fn amp_gridlines(units: AmpUnits, zoom: f32, half_px: f32, min_gap_px: f32) 
     match units {
         AmpUnits::Db => {
             for db in DB_LEVELS {
-                accept(
-                    10f32.powf(db / 20.0),
-                    format!("{db:.0}").replace('-', "−"),
-                    &mut out,
-                );
+                accept(10f32.powf(db / 20.0), db_label(db), &mut out);
             }
         }
         _ => {
@@ -352,15 +349,30 @@ mod tests {
     fn db_labels_use_decimals_only_near_full_scale() {
         let g = amp_gridlines(AmpUnits::Db, 1.0, 500.0, 18.0);
         let labels: Vec<&str> = g.iter().map(|l| l.label.as_str()).collect();
-        assert!(labels.contains(&"-0.5") && labels.contains(&"-1.0"), "{labels:?}");
-        assert!(labels.contains(&"-12") && !labels.contains(&"-12.0"), "{labels:?}");
+        assert!(
+            labels.contains(&"-0.5") && labels.contains(&"-1.0"),
+            "{labels:?}"
+        );
+        assert!(
+            labels.contains(&"-12") && !labels.contains(&"-12.0"),
+            "{labels:?}"
+        );
     }
 
     #[test]
     fn position_formats() {
-        assert_eq!(format_position(48_000.0 * 61.5, 48_000, TimeFormat::Time), "1:01.500");
-        assert_eq!(format_position(48_000.0, 48_000, TimeFormat::Samples), "48000");
-        assert_eq!(format_position(24_000.0, 48_000, TimeFormat::Decimal), "0.500");
+        assert_eq!(
+            format_position(48_000.0 * 61.5, 48_000, TimeFormat::Time),
+            "1:01.500"
+        );
+        assert_eq!(
+            format_position(48_000.0, 48_000, TimeFormat::Samples),
+            "48000"
+        );
+        assert_eq!(
+            format_position(24_000.0, 48_000, TimeFormat::Decimal),
+            "0.500"
+        );
     }
 
     #[test]

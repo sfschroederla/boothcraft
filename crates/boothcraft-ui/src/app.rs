@@ -1,6 +1,7 @@
 use crate::icons::{self, Icon};
 use crate::meters::Meters;
 use crate::ops::OpenFile;
+use crate::scale;
 use crate::view::format_time;
 use crate::waveform;
 use boothcraft_core::{Clipboards, Selection};
@@ -17,6 +18,7 @@ enum Tab {
     Files,
     History,
     Levels,
+    PhaseMeter,
     Selection,
 }
 
@@ -27,6 +29,7 @@ impl Tab {
             Tab::Files => "Files",
             Tab::History => "History",
             Tab::Levels => "Levels",
+            Tab::PhaseMeter => "Phase Meter",
             Tab::Selection => "Selection/View",
         }
     }
@@ -51,6 +54,8 @@ struct State {
     looping: bool,
     dialog: Option<Dialog>,
     display: waveform::DisplayOptions,
+    /// Zoom requested by the transport bar, applied by the waveform on the next frame.
+    pending_zoom: Option<waveform::ZoomCmd>,
 }
 
 pub struct BoothcraftApp {
@@ -60,12 +65,13 @@ pub struct BoothcraftApp {
 
 impl BoothcraftApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> BoothcraftApp {
+        // Editor on top; Selection/View, Phase Meter and Levels side by side underneath. The split
+        // fraction is the share kept by the *existing* node.
         let mut dock = DockState::new(vec![Tab::Editor]);
         let surface = dock.main_surface_mut();
-        let [_main, left] =
-            surface.split_left(NodeIndex::root(), 0.18, vec![Tab::Files, Tab::History]);
-        surface.split_below(left, 0.55, vec![Tab::Selection]);
-        surface.split_below(NodeIndex::root(), 0.82, vec![Tab::Levels]);
+        let [_editor, bottom] = surface.split_below(NodeIndex::root(), 0.82, vec![Tab::Selection]);
+        let [_selection, rest] = surface.split_right(bottom, 0.2, vec![Tab::PhaseMeter]);
+        surface.split_right(rest, 0.25, vec![Tab::Levels]);
 
         let (engine, status) = match Engine::new() {
             Ok(e) => {
@@ -88,6 +94,7 @@ impl BoothcraftApp {
             looping: false,
             dialog: None,
             display: waveform::DisplayOptions::default(),
+            pending_zoom: None,
         };
         for p in paths {
             state.open(&p);
@@ -316,7 +323,7 @@ impl State {
         }
     }
 
-    fn menu(&mut self, ui: &mut egui::Ui) {
+    fn menu(&mut self, ui: &mut egui::Ui, dock: &mut DockState<Tab>) {
         egui::MenuBar::new().ui(ui, |ui| {
             ui.menu_button("File", |ui| {
                 if ui.button("Open…").clicked() {
@@ -437,6 +444,26 @@ impl State {
                     }
                 });
             });
+            ui.menu_button("Window", |ui| {
+                for tab in [
+                    Tab::Files,
+                    Tab::History,
+                    Tab::Selection,
+                    Tab::PhaseMeter,
+                    Tab::Levels,
+                ] {
+                    let open = dock.find_tab(&tab);
+                    let mut checked = open.is_some();
+                    if ui.checkbox(&mut checked, tab.title()).clicked() {
+                        match open {
+                            Some(path) => {
+                                dock.remove_tab(path);
+                            }
+                            None => show_panel(dock, tab),
+                        }
+                    }
+                }
+            });
         });
     }
 
@@ -488,58 +515,154 @@ impl State {
         }
     }
 
-    fn transport_bar(&mut self, ui: &mut egui::Ui) {
+    /// Timecode on the left, transport in the middle, zoom on the right.
+    fn transport_row(&mut self, ui: &mut egui::Ui) {
         let playing = self.shared.as_ref().is_some_and(|s| s.is_playing());
         let has_file = !self.files.is_empty();
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(has_file, |ui| {
-                ui.spacing_mut().item_spacing.x = 3.0;
-                if icons::button(ui, Icon::ToStart, false, "Go to start (Home)").clicked() {
-                    self.go_to(0);
-                }
-                let (icon, tip) = if playing {
-                    (Icon::Pause, "Pause (Space)")
-                } else {
-                    (Icon::Play, "Play (Space)")
-                };
-                if icons::button(ui, icon, playing, tip).clicked() {
-                    self.toggle_play();
-                }
-                if icons::button(ui, Icon::Stop, false, "Stop").clicked() {
-                    self.stop();
-                }
-                let end = self.files.get(self.active).map_or(0, |f| f.doc().frames());
-                if icons::button(ui, Icon::ToEnd, false, "Go to end (End)").clicked() {
-                    self.go_to(end);
-                }
-                ui.add_space(6.0);
-                let tip = if self.looping {
-                    "Loop playback: on"
-                } else {
-                    "Loop playback: off"
-                };
-                if icons::button(ui, Icon::Loop, self.looping, tip).clicked() {
-                    self.looping = !self.looping;
-                }
-                let tip = if self.follow {
-                    "Follow playhead: on"
-                } else {
-                    "Follow playhead: off"
-                };
-                if icons::button(ui, Icon::Follow, self.follow, tip).clicked() {
-                    self.follow = !self.follow;
-                }
-            });
-            ui.add_space(10.0);
-            if let Some(f) = self.files.get(self.active) {
-                let pos = self.playhead();
-                ui.monospace(format!(
-                    "{} / {}",
-                    format_time(pos, f.doc().sample_rate),
-                    format_time(f.doc().frames() as f64, f.doc().sample_rate)
-                ));
-            }
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), TRANSPORT_H),
+            egui::Sense::hover(),
+        );
+        let group_w = |n: usize| n as f32 * 28.0 + n.saturating_sub(1) as f32 * 3.0;
+        let centred = |w: f32| {
+            egui::Rect::from_min_size(
+                egui::pos2(rect.center().x - w / 2.0, rect.top()),
+                egui::vec2(w, rect.height()),
+            )
+        };
+        let layout = egui::Layout::left_to_right(egui::Align::Center);
+
+        // Timecode.
+        let code = self.files.get(self.active).map_or_else(
+            || "0:00.000".to_string(),
+            |f| scale::format_position(self.playhead(), f.doc().sample_rate, self.display.time),
+        );
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect).layout(layout), |ui| {
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(code)
+                    .size(22.0)
+                    .color(egui::Color32::from_rgb(96, 150, 255)),
+            );
         });
+
+        // Transport.
+        let end = self.files.get(self.active).map_or(0, |f| f.doc().frames());
+        let mut zoom = None;
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(centred(group_w(10)))
+                .layout(layout),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                ui.add_enabled_ui(has_file, |ui| {
+                    if icons::button(ui, Icon::Stop, false, "Stop").clicked() {
+                        self.stop();
+                    }
+                    if icons::button(ui, Icon::Play, playing, "Play (Space)").clicked() && !playing
+                    {
+                        self.toggle_play();
+                    }
+                    if icons::button(ui, Icon::Pause, false, "Pause (Space)").clicked() && playing {
+                        self.toggle_play();
+                    }
+                    if icons::button(ui, Icon::ToStart, false, "Go to start (Home)").clicked() {
+                        self.go_to(0);
+                    }
+                    if icons::button(ui, Icon::Rewind, false, "Rewind 2 seconds").clicked() {
+                        self.nudge(-2.0);
+                    }
+                    if icons::button(ui, Icon::FastForward, false, "Fast forward 2 seconds")
+                        .clicked()
+                    {
+                        self.nudge(2.0);
+                    }
+                    if icons::button(ui, Icon::ToEnd, false, "Go to end (End)").clicked() {
+                        self.go_to(end);
+                    }
+                });
+                ui.add_enabled_ui(false, |ui| {
+                    icons::button(ui, Icon::Record, false, "Record (not implemented yet)");
+                });
+                ui.add_enabled_ui(has_file, |ui| {
+                    let tip = if self.looping {
+                        "Loop playback: on"
+                    } else {
+                        "Loop playback: off"
+                    };
+                    if icons::button(ui, Icon::Loop, self.looping, tip).clicked() {
+                        self.looping = !self.looping;
+                    }
+                    let tip = if self.follow {
+                        "Follow playhead: on"
+                    } else {
+                        "Follow playhead: off"
+                    };
+                    if icons::button(ui, Icon::Follow, self.follow, tip).clicked() {
+                        self.follow = !self.follow;
+                    }
+                });
+            },
+        );
+
+        // Zoom, right-aligned.
+        let zoom_group = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - group_w(7) - 4.0, rect.top()),
+            egui::vec2(group_w(7), rect.height()),
+        );
+        ui.scope_builder(
+            egui::UiBuilder::new().max_rect(zoom_group).layout(layout),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                ui.add_enabled_ui(has_file, |ui| {
+                    for (icon, cmd, tip) in [
+                        (
+                            Icon::AmpZoomIn,
+                            waveform::ZoomCmd::AmpIn,
+                            "Zoom in amplitude",
+                        ),
+                        (
+                            Icon::AmpZoomOut,
+                            waveform::ZoomCmd::AmpOut,
+                            "Zoom out amplitude",
+                        ),
+                        (
+                            Icon::AmpReset,
+                            waveform::ZoomCmd::AmpReset,
+                            "Reset amplitude zoom",
+                        ),
+                        (Icon::TimeZoomIn, waveform::ZoomCmd::In, "Zoom in time"),
+                        (Icon::TimeZoomOut, waveform::ZoomCmd::Out, "Zoom out time"),
+                        (
+                            Icon::ZoomSelection,
+                            waveform::ZoomCmd::Selection,
+                            "Zoom to selection",
+                        ),
+                        (Icon::ZoomFull, waveform::ZoomCmd::Full, "Zoom out full"),
+                    ] {
+                        if icons::button(ui, icon, false, tip).clicked() {
+                            zoom = Some(cmd);
+                        }
+                    }
+                });
+            },
+        );
+        if zoom.is_some() {
+            self.pending_zoom = zoom;
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Jump the playhead by `secs` without touching the selection.
+    fn nudge(&mut self, secs: f64) {
+        let (Some(shared), Some(f)) = (&self.shared, self.files.get_mut(self.active)) else {
+            return;
+        };
+        let frames = f.doc().frames();
+        let target = (shared.position() + secs * f.doc().sample_rate as f64)
+            .clamp(0.0, frames as f64) as usize;
+        shared.seek(target);
+        f.reveal_request = Some(target);
     }
 
     /// Move the playhead and cursor to `frame`, clearing any selection.
@@ -556,6 +679,29 @@ impl State {
     }
 }
 
+const TRANSPORT_H: f32 = 36.0;
+
+/// Re-open a closed panel next to the other non-editor panels, or in a new strip under the editor.
+fn show_panel(dock: &mut DockState<Tab>, tab: Tab) {
+    let target = dock
+        .iter_all_tabs()
+        .find(|(_, t)| **t != Tab::Editor)
+        .map(|(p, _)| p);
+    match target {
+        Some(p) => {
+            dock.set_focused_node_and_surface(egui_dock::NodePath {
+                surface: p.surface,
+                node: p.node,
+            });
+            dock.push_to_focused_leaf(tab);
+        }
+        None => {
+            dock.main_surface_mut()
+                .split_below(NodeIndex::root(), 0.82, vec![tab]);
+        }
+    }
+}
+
 struct Viewer<'a> {
     s: &'a mut State,
 }
@@ -564,41 +710,52 @@ impl TabViewer for Viewer<'_> {
     type Tab = Tab;
 
     fn title(&mut self, tab: &mut Tab) -> egui::WidgetText {
-        tab.title().into()
+        match (*tab, self.s.files.get(self.s.active)) {
+            (Tab::Editor, Some(f)) => format!("Editor: {}", f.name).into(),
+            _ => tab.title().into(),
+        }
     }
 
     fn id(&mut self, tab: &mut Tab) -> egui::Id {
         egui::Id::new(tab.title())
     }
 
-    fn is_closeable(&self, _tab: &Tab) -> bool {
-        false
+    fn is_closeable(&self, tab: &Tab) -> bool {
+        *tab != Tab::Editor
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Tab) {
         let s = &mut *self.s;
         match *tab {
             Tab::Editor => {
-                s.transport_bar(ui);
                 let playhead = s.playhead();
                 let playing = s.shared.as_ref().is_some_and(|sh| sh.is_playing());
                 let follow = s.follow && playing;
-                let zoom = waveform::toolbar(ui, &mut s.display, !s.files.is_empty());
+                let zoom = s.pending_zoom.take();
+                let wave_h = (ui.available_height() - TRANSPORT_H).max(60.0);
+                let size = egui::vec2(ui.available_width(), wave_h);
                 if let Some(f) = s.files.get_mut(s.active) {
-                    let ev = waveform::show(ui, f, playhead, follow, &s.display, zoom);
+                    let ev = ui
+                        .allocate_ui(size, |ui| {
+                            waveform::show(ui, f, playhead, follow, &mut s.display, zoom)
+                        })
+                        .inner;
                     if let (Some(at), Some(sh)) = (ev.seek, &s.shared) {
                         sh.seek(at);
                     }
                 } else {
-                    ui.centered_and_justified(|ui| {
-                        if ui
-                            .button("Open an audio file…  (⌘O or drop a file here)")
-                            .clicked()
-                        {
-                            s.pick_and_open();
-                        }
+                    ui.allocate_ui(size, |ui| {
+                        ui.centered_and_justified(|ui| {
+                            if ui
+                                .button("Open an audio file…  (⌘O or drop a file here)")
+                                .clicked()
+                            {
+                                s.pick_and_open();
+                            }
+                        });
                     });
                 }
+                s.transport_row(ui);
             }
             Tab::Files => {
                 let mut pick = None;
@@ -641,51 +798,45 @@ impl TabViewer for Viewer<'_> {
                 let now = ui.input(|i| i.time);
                 s.meters.update(&peaks, now);
                 let ch = s.files.get(s.active).map_or(2, |f| f.doc().channel_count());
-                s.meters.show(ui, ch);
+                s.meters.show_levels(ui, ch);
             }
+            Tab::PhaseMeter => s.meters.show_phase(ui),
             Tab::Selection => {
-                if let Some(f) = s.files.get_mut(s.active) {
-                    let rate = f.doc().sample_rate;
-                    let sel: Selection = f.selection;
-                    egui::Grid::new("selgrid").num_columns(2).show(ui, |ui| {
-                        ui.label("Start");
-                        ui.monospace(format_time(sel.start as f64, rate));
+                let time = s.display.time;
+                let blue = egui::Color32::from_rgb(96, 150, 255);
+                let Some(f) = s.files.get(s.active) else {
+                    return;
+                };
+                let (rate, total) = (f.doc().sample_rate, f.doc().frames());
+                let sel = f.selection;
+                let view_start = f.view.start.max(0.0);
+                let view_end =
+                    (view_start + f.view.visible_frames(f.view_width_px)).min(total as f64);
+                let cell = |ui: &mut egui::Ui, frame: f64| {
+                    ui.label(
+                        egui::RichText::new(scale::format_position(frame, rate, time)).color(blue),
+                    );
+                };
+                egui::Grid::new("selgrid")
+                    .num_columns(4)
+                    .spacing([18.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("");
+                        for h in ["Start", "End", "Duration"] {
+                            ui.label(egui::RichText::new(h).weak());
+                        }
                         ui.end_row();
-                        ui.label("End");
-                        ui.monospace(format_time(sel.end as f64, rate));
+                        ui.label("Selection");
+                        cell(ui, sel.start as f64);
+                        cell(ui, sel.end as f64);
+                        cell(ui, sel.len() as f64);
                         ui.end_row();
-                        ui.label("Length");
-                        ui.monospace(format_time(sel.len() as f64, rate));
-                        ui.end_row();
-                        ui.label("Samples");
-                        ui.monospace(sel.len().to_string());
+                        ui.label("View");
+                        cell(ui, view_start);
+                        cell(ui, view_end);
+                        cell(ui, view_end - view_start);
                         ui.end_row();
                     });
-                    ui.separator();
-                    ui.label("Edit channels");
-                    for c in 0..f.doc().channel_count().min(8) {
-                        let mut on = f.mask.has(c);
-                        if ui
-                            .checkbox(
-                                &mut on,
-                                if c == 0 {
-                                    "Left / 1".to_string()
-                                } else if c == 1 {
-                                    "Right / 2".to_string()
-                                } else {
-                                    format!("Channel {}", c + 1)
-                                },
-                            )
-                            .changed()
-                        {
-                            f.mask.0 = if on {
-                                f.mask.0 | (1 << c)
-                            } else {
-                                f.mask.0 & !(1 << c)
-                            };
-                        }
-                    }
-                }
             }
         }
     }
@@ -705,8 +856,14 @@ impl eframe::App for BoothcraftApp {
             self.state.open(&p);
         }
         self.state.handle_shortcuts(&ctx);
+        let phase = self
+            .state
+            .shared
+            .as_ref()
+            .and_then(|sh| sh.phase_correlation());
+        self.state.meters.update_phase(phase);
 
-        egui::Panel::top("menu").show(ui, |ui| self.state.menu(ui));
+        egui::Panel::top("menu").show(ui, |ui| self.state.menu(ui, &mut self.dock));
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.label(&self.state.status);
         });
