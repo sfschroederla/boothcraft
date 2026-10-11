@@ -141,11 +141,37 @@ impl Preview {
             }
         }
         let mut rebuild = false;
+        let mut forward = Vec::new();
         if let Some(m) = &mut self.plugins {
             let p = m.pump();
             rebuild = p.rebuild;
             if p.scan_finished.is_some() {
                 self.last_scan = p.scan_finished;
+            }
+            // Edits made in a plugin's own interface: remember them, and tell the processor
+            // playing in the preview rack (rack slot and parameter index).
+            for (slot, id, value) in p.param_edits {
+                m.note_edit(slot, id, value);
+                let rack_slot = self.installed.as_ref().and_then(|d| {
+                    d.slots
+                        .iter()
+                        .position(|s| s.as_ref().is_some_and(|s| s.id == slot))
+                });
+                let index = m
+                    .specs(slot)
+                    .and_then(|(_, ids)| ids.iter().position(|i| *i == id));
+                if let (Some(r), Some(k)) = (rack_slot, index) {
+                    forward.push((r, k, value));
+                }
+            }
+        }
+        if self.owner.is_some() {
+            for (r, k, v) in forward {
+                self.send(RackMsg::Param {
+                    slot: r as u8,
+                    index: k as u16,
+                    value: v,
+                });
             }
         }
         if rebuild && self.owner.is_some() {
@@ -577,6 +603,9 @@ pub enum EffectAction {
     TogglePlayback,
     /// Show the Plugin Manager window (to scan for plugins).
     OpenPluginManager,
+    /// Open the plugin's own interface for the rack slot at this index.
+    OpenEditor(usize),
+    CloseEditor(usize),
 }
 
 /// The Effects Rack panel.
@@ -584,6 +613,8 @@ pub enum EffectAction {
 pub struct RackPanel {
     pub desc: RackDesc,
     selected: Option<usize>,
+    /// What is typed in the Plugins menu's search box.
+    plugin_filter: String,
 }
 
 impl RackPanel {
@@ -591,6 +622,7 @@ impl RackPanel {
         &mut self,
         ui: &mut Ui,
         preview: &mut Preview,
+        editors: &crate::plugin_editor_ui::PluginEditors,
         has_file: bool,
     ) -> Option<EffectAction> {
         let mut action = None;
@@ -747,21 +779,19 @@ impl RackPanel {
                                             }
                                             ui.separator();
                                         } else {
+                                            let mut picked = None;
                                             ui.menu_button("Plugins", |ui| {
-                                                for (vendor, list) in m.catalog().by_vendor() {
-                                                    ui.menu_button(vendor, |ui| {
-                                                        for d in list {
-                                                            if ui.button(&d.name).clicked() {
-                                                                self.desc.slots[i] =
-                                                                    Some(m.new_slot(d));
-                                                                self.selected = Some(i);
-                                                                structural = true;
-                                                                ui.close();
-                                                            }
-                                                        }
-                                                    });
-                                                }
+                                                picked = plugin_menu(ui, m, &mut self.plugin_filter);
                                             });
+                                            if let Some(d) = picked {
+                                                self.desc.slots[i] = Some(m.new_slot(&d));
+                                                self.selected = Some(i);
+                                                structural = true;
+                                                // Show the plugin's own interface right away.
+                                                action = Some(EffectAction::OpenEditor(i));
+                                                self.plugin_filter.clear();
+                                                ui.close();
+                                            }
                                             ui.separator();
                                         }
                                     }
@@ -787,7 +817,9 @@ impl RackPanel {
         if let Some(i) = self.selected {
             if let Some(slot) = &mut self.desc.slots[i] {
                 if slot.plugin.is_some() {
-                    plugin_editor(ui, preview, i, slot);
+                    if let Some(a) = plugin_editor(ui, preview, editors, i, slot) {
+                        action = Some(a);
+                    }
                 } else if let (Some(info), Some(specs)) =
                     (registry::info(&slot.effect), registry::specs(&slot.effect))
                 {
@@ -865,6 +897,65 @@ impl RackPanel {
     }
 }
 
+/// The Plugins menu: a search box, then either the matches or one folder per vendor. Scrolls, since
+/// there can be hundreds of plugins. Returns the plugin picked, if any.
+fn plugin_menu(
+    ui: &mut Ui,
+    m: &PluginManager,
+    filter: &mut String,
+) -> Option<boothcraft_plugin::PluginDescriptor> {
+    let mut picked = None;
+    let max_h = (ui.ctx().content_rect().height() * 0.7).max(200.0);
+    ui.add(
+        egui::TextEdit::singleline(filter)
+            .hint_text("Search plugins")
+            .desired_width(240.0),
+    );
+    let needle = filter.trim().to_lowercase();
+    egui::ScrollArea::vertical()
+        .id_salt("plugins_menu")
+        .max_height(max_h)
+        .show(ui, |ui| {
+            if needle.is_empty() {
+                for (vendor, list) in m.catalog().by_vendor() {
+                    ui.menu_button(format!("{vendor} ({})", list.len()), |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt(("plugins_vendor", vendor.as_str()))
+                            .max_height(max_h)
+                            .show(ui, |ui| {
+                                for d in list {
+                                    if ui.button(&d.name).clicked() {
+                                        picked = Some(d.clone());
+                                        ui.close();
+                                    }
+                                }
+                            });
+                    });
+                }
+            } else {
+                let mut hits: Vec<_> = m
+                    .catalog()
+                    .all()
+                    .filter(|d| {
+                        d.name.to_lowercase().contains(&needle)
+                            || d.vendor.to_lowercase().contains(&needle)
+                    })
+                    .collect();
+                hits.sort_by_key(|d| d.name.to_lowercase());
+                if hits.is_empty() {
+                    ui.label(RichText::new("No match").weak());
+                }
+                for d in hits {
+                    if ui.button(format!("{}  ·  {}", d.name, d.vendor)).clicked() {
+                        picked = Some(d.clone());
+                        ui.close();
+                    }
+                }
+            }
+        });
+    picked
+}
+
 /// A short status for a plugin slot that is not (yet) usable, with the reason for the tooltip.
 fn plugin_badge(
     preview: &mut Preview,
@@ -888,8 +979,16 @@ fn plugin_badge(
     Some((badge, err.to_string()))
 }
 
-/// The generic parameter editor for a plugin slot: parameters come from the plugin itself.
-fn plugin_editor(ui: &mut Ui, preview: &mut Preview, index: usize, slot: &mut SlotDesc) {
+/// What the panel shows for a selected plugin slot: a button for the plugin's own interface,
+/// and the generic parameter controls (open by default only when there is no interface).
+fn plugin_editor(
+    ui: &mut Ui,
+    preview: &mut Preview,
+    editors: &crate::plugin_editor_ui::PluginEditors,
+    index: usize,
+    slot: &mut SlotDesc,
+) -> Option<EffectAction> {
+    let mut action = None;
     let name = slot
         .plugin
         .as_ref()
@@ -899,25 +998,44 @@ fn plugin_editor(ui: &mut Ui, preview: &mut Preview, index: usize, slot: &mut Sl
     if let Err(e) = preview.ensure_loaded(slot) {
         ui.label(RichText::new(e.to_string()).weak());
         ui.separator();
-        return;
+        return None;
+    }
+    let open = editors.is_open(slot.id);
+    ui.horizontal(|ui| {
+        if open {
+            if ui.button("Close Interface").clicked() {
+                action = Some(EffectAction::CloseEditor(index));
+            }
+            ui.label(RichText::new("The plugin's own window is open.").weak());
+        } else if ui.button("Open Interface").clicked() {
+            action = Some(EffectAction::OpenEditor(index));
+        }
+    });
+    if let Some(why) = editors.unavailable(slot.id) {
+        ui.label(RichText::new(format!("No interface: {why}")).weak());
     }
     let Some((specs, current)) = preview.plugin_params(slot.id) else {
-        return;
+        return action;
     };
-    if slot.values.len() != specs.len() {
-        slot.values = current;
-    }
+    // The plugin's own interface changes values behind our back: always show what it holds.
+    slot.values = current;
     let slot_id = slot.id;
-    for (k, v) in effect_editor(
-        ui,
-        ("rack_params", index),
-        &slot.effect,
-        &specs,
-        &mut slot.values,
-    ) {
-        preview.plugin_param(Owner::Rack, index, slot_id, k, v);
-    }
+    egui::CollapsingHeader::new("Parameters")
+        .id_salt(("plugin_params", slot_id.0))
+        .default_open(!open)
+        .show(ui, |ui| {
+            for (k, v) in effect_editor(
+                ui,
+                ("rack_params", index),
+                &slot.effect,
+                &specs,
+                &mut slot.values,
+            ) {
+                preview.plugin_param(Owner::Rack, index, slot_id, k, v);
+            }
+        });
     ui.separator();
+    action
 }
 
 /// A single effect opened from the Effects menu.

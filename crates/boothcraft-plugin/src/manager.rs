@@ -483,6 +483,28 @@ impl PluginManager {
         }
     }
 
+    /// The plugin's own interface for a loaded slot (`None`: it has none). The caller must close
+    /// and drop the editor before the slot's instance goes away.
+    pub fn create_editor(
+        &mut self,
+        slot: SlotId,
+    ) -> Result<Option<Box<dyn crate::traits::PluginEditor>>, crate::error::HostError> {
+        let mt = self.mt;
+        match self.live.get_mut(&slot).and_then(|l| l.instance.as_mut()) {
+            Some(inst) => inst.editor(mt),
+            None => Err(crate::error::HostError::Load(
+                "the plugin is not loaded".into(),
+            )),
+        }
+    }
+
+    /// An edit made in the plugin's own interface: remember it like a generic-UI edit.
+    pub fn note_edit(&mut self, slot: SlotId, id: u32, value: f32) {
+        if let Some(inst) = self.live.get_mut(&slot).and_then(|l| l.instance.as_mut()) {
+            inst.note_edit(id, value);
+        }
+    }
+
     /// Whether the plugin's output went bad (NaN or infinity) since the last call.
     pub fn take_bad_output(&self, slot: SlotId) -> bool {
         self.live.get(&slot).is_some_and(|l| {

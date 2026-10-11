@@ -7,6 +7,7 @@
 // redundant on one platform are needed on another.
 #![allow(clippy::unnecessary_cast)]
 
+mod editor;
 mod format;
 mod host;
 mod instance;

@@ -1,0 +1,15 @@
+[package]
+name = "boothcraft-plugin-window"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Creates native windows for plugin editors, so it needs unsafe code. See `boothcraft-plugin-vst3`
+# for why the lints are copied by hand; `scripts/check_lints.sh` enforces them.
+[lints.rust]
+unsafe_code = "deny"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSGeometry", "NSString", "NSObject"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSView", "NSWindow", "NSGraphics", "NSScreen"] }

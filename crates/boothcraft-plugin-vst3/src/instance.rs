@@ -285,6 +285,22 @@ impl PluginInstance for Vst3Instance {
         self.edits.insert(id, value);
     }
 
+    fn editor(
+        &mut self,
+        _mt: MainThread,
+    ) -> Result<Option<Box<dyn boothcraft_plugin::PluginEditor>>, HostError> {
+        let raw = unsafe { self.controller.createView(c"editor".as_ptr()) };
+        let Some(view) = (unsafe { ComPtr::from_raw(raw) }) else {
+            return Ok(None); // no interface of its own
+        };
+        Ok(crate::editor::Vst3Editor::new(view)
+            .map(|e| Box::new(e) as Box<dyn boothcraft_plugin::PluginEditor>))
+    }
+
+    fn note_edit(&mut self, id: u32, value: f32) {
+        self.edits.insert(id, value);
+    }
+
     fn pending_params(&self) -> Vec<(u32, f32)> {
         self.edits.iter().map(|(k, v)| (*k, *v)).collect()
     }

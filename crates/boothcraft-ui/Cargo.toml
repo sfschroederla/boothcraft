@@ -13,6 +13,8 @@ boothcraft-io.workspace = true
 boothcraft-dsp.workspace = true
 boothcraft-engine.workspace = true
 boothcraft-plugin.workspace = true
+boothcraft-plugin-window.workspace = true
+raw-window-handle = "0.6"
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "persistence"] }
 egui_dock = { version = "0.21", features = ["serde"] }
 rfd = "0.15"

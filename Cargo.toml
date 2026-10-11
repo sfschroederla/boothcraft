@@ -7,6 +7,7 @@ members = [
     "crates/boothcraft-engine",
     "crates/boothcraft-plugin",
     "crates/boothcraft-plugin-vst3",
+    "crates/boothcraft-plugin-window",
     "crates/boothcraft-vst3-test-plugin",
     "crates/boothcraft-ui",
     "crates/boothcraft-app",
@@ -27,6 +28,7 @@ boothcraft-dsp = { path = "crates/boothcraft-dsp" }
 boothcraft-engine = { path = "crates/boothcraft-engine" }
 boothcraft-plugin = { path = "crates/boothcraft-plugin" }
 boothcraft-plugin-vst3 = { path = "crates/boothcraft-plugin-vst3" }
+boothcraft-plugin-window = { path = "crates/boothcraft-plugin-window" }
 boothcraft-ui = { path = "crates/boothcraft-ui" }
 thiserror = "2"
 proptest = "1"

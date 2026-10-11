@@ -179,6 +179,32 @@ pub trait PluginFormat: Send + Sync {
     ) -> Pending<Box<dyn PluginInstance>>;
 }
 
+/// The native parent a plugin editor draws into.
+#[derive(Clone, Copy, Debug)]
+pub enum NativeParent {
+    /// An `NSView*` (macOS).
+    NSView(*mut std::ffi::c_void),
+    /// An `HWND` (Windows).
+    Hwnd(*mut std::ffi::c_void),
+    /// An X11 window id (Linux).
+    X11(u64),
+}
+
+/// A plugin's own interface. Main thread only. Close it (and drop it) before the instance it
+/// came from is released.
+pub trait PluginEditor {
+    /// Preferred size in points.
+    fn size(&self) -> (u32, u32);
+    fn resizable(&self) -> bool;
+    /// Draw into `parent`.
+    fn attach(&mut self, parent: NativeParent) -> Result<(), HostError>;
+    /// The host window was resized: tell the plugin. Returns the size the plugin settled on.
+    fn set_size(&mut self, width: u32, height: u32) -> (u32, u32);
+    /// The plugin asked to be a different size (once; the host resizes its window).
+    fn take_resize_request(&mut self) -> Option<(u32, u32)>;
+    fn close(&mut self);
+}
+
 pub trait PluginInstance {
     fn params(&self) -> Vec<ParamInfo>;
     fn set_param(&mut self, mt: MainThread, id: u32, value: f32);
@@ -193,6 +219,15 @@ pub trait PluginInstance {
         cfg: &ProcessConfig,
     ) -> Result<(Box<dyn PluginProcessor>, Activated), HostError>;
     fn deactivate(&mut self, mt: MainThread, processor: Box<dyn PluginProcessor>);
+    /// The plugin's own interface, if it has one.
+    fn editor(&mut self, _mt: MainThread) -> Result<Option<Box<dyn PluginEditor>>, HostError> {
+        Ok(None)
+    }
+
+    /// The plugin's own editor changed a parameter (a value in our plain units): remember it,
+    /// as for an edit made in the generic controls. The plugin already holds the value.
+    fn note_edit(&mut self, _id: u32, _value: f32) {}
+
     /// Parameter values the processor must be told about because the saved state alone does not
     /// carry them (VST3 only moves an edit into the component through `process`). The host
     /// queues these into every new processor.

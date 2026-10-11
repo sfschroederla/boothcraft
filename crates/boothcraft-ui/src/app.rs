@@ -9,6 +9,7 @@ use crate::meters::Meters;
 use crate::ops::OpenFile;
 #[cfg(not(target_os = "macos"))]
 use crate::ops::ZeroAdjust;
+use crate::plugin_editor_ui::PluginEditors;
 use crate::plugin_manager_ui::PluginManagerPanel;
 use crate::scale;
 use crate::selview_panel::SelViewPanel;
@@ -137,6 +138,11 @@ struct State {
     preview: Preview,
     rack_panel: RackPanel,
     plugin_manager: PluginManagerPanel,
+    plugin_editors: PluginEditors,
+    /// Developer hook (`BOOTHCRAFT_DEV_OPEN_EDITOR=<plugin id>`): add that plugin to the rack and
+    /// open its interface on the first frame. `BOOTHCRAFT_DEV_QUIT_AFTER=<secs>` then quits.
+    dev_open_editor: Option<String>,
+    dev_quit_at: Option<std::time::Instant>,
     effect_dialog: Option<EffectDialog>,
     apply_job: Option<ApplyJob>,
     generator: Option<Generator>,
@@ -339,6 +345,9 @@ impl BoothcraftApp {
             rack_panel: RackPanel::default(),
             // Open straight away if the last session ended in a crash with plugins loaded.
             plugin_manager: PluginManagerPanel::new(plugins_crashed),
+            plugin_editors: PluginEditors::default(),
+            dev_open_editor: std::env::var("BOOTHCRAFT_DEV_OPEN_EDITOR").ok(),
+            dev_quit_at: None,
             effect_dialog: None,
             apply_job: None,
             generator: None,
@@ -556,6 +565,21 @@ impl State {
         match action {
             EffectAction::TogglePlayback => self.toggle_play(),
             EffectAction::OpenPluginManager => self.plugin_manager.open = true,
+            EffectAction::OpenEditor(i) => {
+                let slot = self.rack_panel.desc.slots.get(i).cloned().flatten();
+                if let (Some(slot), Some(m)) = (slot, self.preview.plugins.as_mut()) {
+                    let title = slot.plugin.as_ref().map_or_else(
+                        || "Plugin".to_string(),
+                        |p| format!("{} (slot {})", p.name, i + 1),
+                    );
+                    self.plugin_editors.open(m, &slot, &title);
+                }
+            }
+            EffectAction::CloseEditor(i) => {
+                if let Some(Some(slot)) = self.rack_panel.desc.slots.get(i) {
+                    self.plugin_editors.close(slot.id);
+                }
+            }
             EffectAction::Apply { label, mut kind } => {
                 if self.apply_job.is_some() {
                     return;
@@ -617,8 +641,53 @@ impl State {
         }
     }
 
+    /// See `dev_open_editor`.
+    fn dev_hook(&mut self, ctx: &egui::Context) {
+        if let Some(id) = self.dev_open_editor.take() {
+            let found = self
+                .preview
+                .plugins
+                .as_ref()
+                .and_then(|m| m.catalog().get(&id).map(|d| m.new_slot(d)));
+            match found {
+                Some(slot) => {
+                    self.rack_panel.desc.slots[0] = Some(slot);
+                    self.effect_action(EffectAction::OpenEditor(0));
+                    let id = self.rack_panel.desc.slots[0].as_ref().map(|s| s.id);
+                    match id.and_then(|i| self.plugin_editors.window_number(i)) {
+                        Some(n) => {
+                            let d = id.and_then(|i| self.plugin_editors.describe(i));
+                            eprintln!("dev: editor window number {n}; {}", d.unwrap_or_default());
+                        }
+                        None => {
+                            let why = id
+                                .and_then(|i| self.plugin_editors.unavailable(i))
+                                .unwrap_or("unknown")
+                                .to_string();
+                            eprintln!("dev: editor did not open: {why}");
+                        }
+                    }
+                }
+                None => eprintln!("dev: no plugin {id:?} in the catalog"),
+            }
+            let secs = std::env::var("BOOTHCRAFT_DEV_QUIT_AFTER")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok());
+            self.dev_quit_at =
+                secs.map(|s| std::time::Instant::now() + std::time::Duration::from_secs(s));
+        }
+        if let Some(at) = self.dev_quit_at {
+            if std::time::Instant::now() >= at {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+
     /// Per-frame effect plumbing: the open effect dialog and any Apply in progress.
     fn effects_frame(&mut self, ctx: &egui::Context) {
+        self.dev_hook(ctx);
         self.preview.tick();
         if let Some(f) = self.files.get(self.active) {
             self.preview.set_doc_channels(f.doc().channel_count());
@@ -632,6 +701,9 @@ impl State {
             .flatten()
             .map(|s| s.id)
             .collect();
+        // A plugin's interface must be closed before its instance can be released.
+        self.plugin_editors.close_except(&keep);
+        self.plugin_editors.frame();
         self.preview.sweep_plugins(&keep);
         if self.apply_job.is_none() {
             if let Some((i, label, kind)) = self.apply_queue.pop_front() {
@@ -983,6 +1055,32 @@ impl State {
         action: crate::native_menu::Action,
     ) {
         use crate::native_menu::Action;
+        // While a plugin's own window has keyboard focus, keep document actions away from the
+        // document; Close closes the plugin's window instead.
+        if self.plugin_editors.any_key() {
+            match action {
+                Action::Close => {
+                    self.plugin_editors.close_key();
+                    return;
+                }
+                Action::Undo
+                | Action::Redo
+                | Action::Cut
+                | Action::Copy
+                | Action::Paste
+                | Action::MixPaste
+                | Action::Delete
+                | Action::SelectAll
+                | Action::CropToSelection
+                | Action::Save
+                | Action::SaveAs
+                | Action::ZeroAdjust(_)
+                | Action::Invert
+                | Action::Reverse
+                | Action::Silence => return,
+                _ => {}
+            }
+        }
         match action {
             Action::NewFile => {
                 self.dialog = Some(Dialog::NewFile {
@@ -2009,7 +2107,10 @@ impl TabViewer for Viewer<'_> {
             }
             Tab::EffectsRack => {
                 let has_file = !s.files.is_empty();
-                if let Some(a) = s.rack_panel.show(ui, &mut s.preview, has_file) {
+                if let Some(a) = s
+                    .rack_panel
+                    .show(ui, &mut s.preview, &s.plugin_editors, has_file)
+                {
                     s.effect_action(a);
                 }
             }
@@ -2036,8 +2137,17 @@ impl TabViewer for Viewer<'_> {
 }
 
 impl eframe::App for BoothcraftApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // Plugin interfaces are child windows of this one.
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(h) = frame.window_handle() {
+                if let RawWindowHandle::AppKit(a) = h.as_raw() {
+                    self.state.plugin_editors.parent_view = Some(a.ns_view.as_ptr());
+                }
+            }
+        }
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -2130,14 +2240,17 @@ impl eframe::App for BoothcraftApp {
         }
     }
 
-    /// Persists panel placement and the recent-files list; window position/size are handled by
-    /// `eframe` itself. Only takes effect with the "persistence" feature enabled on `eframe`
-    /// (it is, for both `boothcraft-app` and `boothcraft-ui`).
     /// Releases plugins on the main thread, in order, before the audio engine goes away.
     fn on_exit(&mut self) {
+        // Shutdown order: close the plugins' own windows, then release the plugins on this
+        // thread, then (as fields drop) the audio engine.
+        self.state.plugin_editors.close_all();
         self.state.preview.shutdown();
     }
 
+    /// Persists panel placement and the recent-files list; window position/size are handled by
+    /// `eframe` itself. Only takes effect with the "persistence" feature enabled on `eframe`
+    /// (it is, for both `boothcraft-app` and `boothcraft-ui`).
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, DOCK_STORAGE_KEY, &self.dock);
         eframe::set_value(storage, RECENT_FILES_STORAGE_KEY, &self.state.recent_files);

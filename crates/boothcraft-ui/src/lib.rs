@@ -11,6 +11,7 @@ mod meters;
 mod native_menu;
 mod ops;
 mod param_ui;
+mod plugin_editor_ui;
 mod plugin_manager_ui;
 mod scale;
 mod selview_panel;
