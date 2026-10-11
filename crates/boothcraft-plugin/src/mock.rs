@@ -125,11 +125,13 @@ impl PluginFormat for MockFormat {
         out
     }
 
-    fn exit_scan_worker(&self, code: i32) -> ! {
-        if CRASH_AT_EXIT.load(Relaxed) {
-            std::process::abort();
+    fn worker_exit(&self) -> fn(i32) -> ! {
+        |code| {
+            if CRASH_AT_EXIT.load(Relaxed) {
+                std::process::abort();
+            }
+            std::process::exit(code)
         }
-        std::process::exit(code)
     }
 
     fn bundled(&self) -> Vec<PluginDescriptor> {

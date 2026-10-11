@@ -226,3 +226,61 @@ fn manager_scans_in_the_background_and_manages_the_results() {
     );
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// A worker stuck in a hung plugin must end itself, with no scanner left to kill it.
+#[cfg(unix)]
+#[test]
+fn a_hung_worker_ends_itself() {
+    let dir = temp("watchdog");
+    let hang = touch(&dir, "hang.mock");
+    let started = Instant::now();
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_bc-scan-worker-mock"))
+        .args(["--plugin-scan-worker", "mock"])
+        .arg(&hang)
+        .env("BOOTHCRAFT_SCAN_WORKER_MAX_SECS", "1")
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(3), "ended by its own time limit");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// If the app that started a worker dies, the worker goes with it.
+#[cfg(unix)]
+#[test]
+fn an_orphaned_worker_ends_itself() {
+    let dir = temp("orphan");
+    let hang = touch(&dir, "hang.mock");
+    // A shell starts the worker in the background and exits at once, orphaning it.
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "BOOTHCRAFT_SCAN_PARENT=$$ '{}' --plugin-scan-worker mock '{}' >/dev/null 2>&1 & echo $!",
+            env!("CARGO_BIN_EXE_bc-scan-worker-mock"),
+            hang.display()
+        ))
+        .output()
+        .unwrap();
+    let pid: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+    let alive = |pid: u32| {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alive(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let still = alive(pid);
+    if still {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
+    }
+    assert!(!still, "the orphaned worker should have exited by itself");
+    std::fs::remove_dir_all(dir).ok();
+}

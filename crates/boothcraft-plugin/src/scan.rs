@@ -21,6 +21,37 @@ use std::time::{Duration, Instant};
 
 pub const WORKER_FLAG: &str = "--plugin-scan-worker";
 
+/// A worker never lives longer than this, whatever a plugin does (the scanner's own limits are
+/// far shorter; this is for workers whose scanner is gone). `BOOTHCRAFT_SCAN_WORKER_MAX_SECS`
+/// overrides it (tests).
+const WORKER_MAX_LIFETIME: Duration = Duration::from_secs(600);
+
+/// Ends this worker if the app that started it dies (a hung plugin would otherwise run forever
+/// with nobody left to kill it) or if it outlives [`WORKER_MAX_LIFETIME`].
+fn start_watchdog(exit: fn(i32) -> !) {
+    let max = std::env::var("BOOTHCRAFT_SCAN_WORKER_MAX_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(WORKER_MAX_LIFETIME, Duration::from_secs);
+    // The scanner names itself, so a parent that dies before this thread starts is still noticed.
+    #[cfg(unix)]
+    let parent = std::env::var("BOOTHCRAFT_SCAN_PARENT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or_else(std::os::unix::process::parent_id);
+    let started = Instant::now();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(500));
+        #[cfg(unix)]
+        if std::os::unix::process::parent_id() != parent {
+            exit(2); // reparented: the app is gone
+        }
+        if started.elapsed() > max {
+            exit(3);
+        }
+    });
+}
+
 /// How to start a scan worker.
 #[derive(Clone, Debug)]
 pub struct WorkerCommand {
@@ -44,6 +75,7 @@ impl WorkerCommand {
             .arg(WORKER_FLAG)
             .arg(format)
             .arg(path)
+            .env("BOOTHCRAFT_SCAN_PARENT", std::process::id().to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -123,6 +155,7 @@ pub fn maybe_run_scan_worker(formats: &[Box<dyn PluginFormat>]) {
             match formats.iter().find(|f| f.kind() == kind) {
                 Some(f) => {
                     chosen = Some(f.as_ref());
+                    start_watchdog(f.worker_exit());
                     f.init_scan_worker();
                     let cand = Candidate {
                         path: PathBuf::from(path),
@@ -155,7 +188,7 @@ pub fn maybe_run_scan_worker(formats: &[Box<dyn PluginFormat>]) {
     let _ = out.flush();
     drop(out);
     match chosen {
-        Some(f) => f.exit_scan_worker(0),
+        Some(f) => (f.worker_exit())(0),
         None => std::process::exit(0),
     }
 }
