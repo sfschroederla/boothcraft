@@ -120,6 +120,9 @@ fn apply_effect(
 }
 
 fn main() -> Result<()> {
+    // Removes the disk-backed block store's segment directory when this function returns,
+    // including on an early `?` return.
+    let _cleanup = boothcraft_core::install_cleanup_guard();
     match Cli::parse().command {
         Command::Effects => {
             for info in boothcraft_dsp::registry::EFFECTS {

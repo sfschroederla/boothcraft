@@ -2,9 +2,9 @@
 
 use crate::ops::OpenFile;
 use crate::param_ui::{effect_editor, envelope_editor};
-use boothcraft_core::{ChannelMask, Selection};
+use boothcraft_core::{ChannelMask, Rope, Selection};
 use boothcraft_dsp::preset::{self, Preset};
-use boothcraft_dsp::rack::{render_offline, SLOTS};
+use boothcraft_dsp::rack::{render_rope, SLOTS};
 use boothcraft_dsp::registry::{self, Category, EFFECTS};
 use boothcraft_dsp::{Envelope, Rack, RackDesc, SlotDesc};
 use boothcraft_engine::{RackControl, RackMsg};
@@ -139,6 +139,17 @@ pub enum ApplyKind {
     },
 }
 
+/// What an [`ApplyJob`] produced, ready to be spliced or copied back into the document.
+pub enum ApplyResult {
+    /// The whole selection, pre-materialized as flat per-channel buffers (the offline-effect and
+    /// Match Loudness paths, which need the whole range in memory for their own analysis anyway).
+    Flat(Vec<Vec<f32>>),
+    /// The whole selection as ropes, built up and processed in chunks without ever materializing
+    /// as one buffer (the real-time rack path, so a selection spanning most or all of a large,
+    /// disk-backed file doesn't need a second full-size in-memory copy).
+    Ropes(Vec<Rope>),
+}
+
 /// An effect being rendered over a file's selection on a worker thread.
 pub struct ApplyJob {
     pub file: usize,
@@ -147,7 +158,7 @@ pub struct ApplyJob {
     channels: Vec<usize>,
     progress: Arc<AtomicU32>,
     cancel: Arc<AtomicBool>,
-    rx: mpsc::Receiver<Option<Vec<Vec<f32>>>>,
+    rx: mpsc::Receiver<Option<ApplyResult>>,
 }
 
 impl ApplyJob {
@@ -192,18 +203,46 @@ impl ApplyJob {
         channels: Vec<usize>,
     ) -> ApplyJob {
         let doc = file.doc();
-        let mut chans: Vec<Vec<f32>> = channels
-            .iter()
-            .map(|&c| doc.channels[c].to_vec(range.clone()))
-            .collect();
         let rate = doc.sample_rate as f32;
         let progress = Arc::new(AtomicU32::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let (p, c) = (progress.clone(), cancel.clone());
+
+        // The rack path reads and writes directly through ropes in chunks (see `render_rope`), so
+        // a selection spanning most or all of a large file is never copied into one flat buffer.
+        // Cloning a rope is cheap (it shares blocks structurally; O(blocks), not O(samples)).
+        // The other kinds need their whole range as flat buffers anyway for their own analysis
+        // (a peak scan, an LUFS pass, …), so they keep materializing it up front.
+        if let ApplyKind::Rack(desc) = kind {
+            let ropes: Vec<Rope> = channels
+                .iter()
+                .map(|&ch| doc.channels[ch].clone())
+                .collect();
+            let render_range = range.clone();
+            std::thread::spawn(move || {
+                let result =
+                    render_rope(&desc, &ropes, render_range, rate, &p, &c).map(ApplyResult::Ropes);
+                let _ = tx.send(result);
+            });
+            return ApplyJob {
+                file: file_index,
+                label,
+                range,
+                channels,
+                progress,
+                cancel,
+                rx,
+            };
+        }
+
+        let mut chans: Vec<Vec<f32>> = channels
+            .iter()
+            .map(|&c| doc.channels[c].to_vec(range.clone()))
+            .collect();
         std::thread::spawn(move || {
             let ok = match kind {
-                ApplyKind::Rack(desc) => render_offline(&desc, &mut chans, rate, &p, &c),
+                ApplyKind::Rack(_) => unreachable!("handled above"),
                 ApplyKind::MatchLoudness { target, ceiling } => {
                     let applied = boothcraft_dsp::loudness::match_loudness(
                         &mut chans,
@@ -234,7 +273,7 @@ impl ApplyJob {
                     None => false,
                 },
             };
-            let _ = tx.send(ok.then_some(chans));
+            let _ = tx.send(ok.then_some(ApplyResult::Flat(chans)));
         });
         ApplyJob {
             file: file_index,
@@ -256,7 +295,7 @@ impl ApplyJob {
     }
 
     /// `Some(result)` once the worker has finished (`None` inside means cancelled or failed).
-    pub fn poll(&self) -> Option<Option<Vec<Vec<f32>>>> {
+    pub fn poll(&self) -> Option<Option<ApplyResult>> {
         match self.rx.try_recv() {
             Ok(r) => Some(r),
             Err(mpsc::TryRecvError::Empty) => None,
@@ -265,20 +304,33 @@ impl ApplyJob {
     }
 
     /// Write the rendered audio back as one undoable step.
-    pub fn commit(&self, file: &mut OpenFile, result: Vec<Vec<f32>>) {
+    pub fn commit(&self, file: &mut OpenFile, result: ApplyResult) {
         let mut d = file.doc().clone();
-        let mut mask = 0u32;
-        for &c in &self.channels {
-            mask |= 1 << c;
-        }
-        let channels = &self.channels;
-        d.apply(self.range.clone(), ChannelMask(mask), |c, s| {
-            if let Some(k) = channels.iter().position(|&x| x == c) {
-                let src = &result[k];
-                let n = s.len().min(src.len());
-                s[..n].copy_from_slice(&src[..n]);
+        match result {
+            ApplyResult::Flat(result) => {
+                let mut mask = 0u32;
+                for &c in &self.channels {
+                    mask |= 1 << c;
+                }
+                let channels = &self.channels;
+                d.apply(self.range.clone(), ChannelMask(mask), |c, s| {
+                    if let Some(k) = channels.iter().position(|&x| x == c) {
+                        let src = &result[k];
+                        let n = s.len().min(src.len());
+                        s[..n].copy_from_slice(&src[..n]);
+                    }
+                });
             }
-        });
+            ApplyResult::Ropes(ropes) => {
+                // Splice the processed audio in directly: cheap, structural-sharing edits on the
+                // affected channels rather than a `map_range`-style whole-range copy. Markers need
+                // no adjustment, since the replacement is exactly as long as what it replaces.
+                for (&c, replacement) in self.channels.iter().zip(&ropes) {
+                    d.channels[c].delete(self.range.clone());
+                    d.channels[c].insert(self.range.start, replacement);
+                }
+            }
+        }
         file.commit(&self.label, d);
         file.selection =
             Selection::new(self.range.start, self.range.end).clamp(file.doc().frames());
@@ -754,7 +806,7 @@ mod tests {
     use super::*;
     use boothcraft_core::{Document, Rope};
 
-    fn wait(job: &ApplyJob) -> Option<Vec<Vec<f32>>> {
+    fn wait(job: &ApplyJob) -> Option<ApplyResult> {
         for _ in 0..500 {
             if let Some(r) = job.poll() {
                 return r;

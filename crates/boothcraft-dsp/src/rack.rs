@@ -3,7 +3,9 @@
 use crate::effect::Effect;
 use crate::param::db_to_gain;
 use crate::registry;
+use boothcraft_core::Rope;
 use serde::{Deserialize, Serialize};
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
 pub const SLOTS: usize = 16;
@@ -261,6 +263,59 @@ pub fn render_offline(
     true
 }
 
+/// Like [`render_offline`], but reads `range` directly from `channels` (zero-padded past
+/// `range.end`, like a selection near the end of a shorter file) and returns the result as new
+/// ropes instead of flat buffers — so a selection covering most or all of a disk-backed file never
+/// needs materializing as one giant in-memory copy, before, during or after processing. `None`
+/// means the render was cancelled.
+pub fn render_rope(
+    desc: &RackDesc,
+    channels: &[Rope],
+    range: Range<usize>,
+    sample_rate: f32,
+    progress: &AtomicU32,
+    cancel: &AtomicBool,
+) -> Option<Vec<Rope>> {
+    const BLOCK: usize = 4096;
+    let n = range.end.saturating_sub(range.start);
+    let mut rack = Rack::new(desc, sample_rate, channels.len(), BLOCK);
+    let latency = rack.latency();
+    let total = n + latency;
+    let mut block: Vec<Vec<f32>> = vec![vec![0.0; BLOCK]; channels.len()];
+    let mut out: Vec<Rope> = vec![Rope::new(); channels.len()];
+    let mut at = 0;
+    while at < total {
+        if cancel.load(Relaxed) {
+            return None;
+        }
+        let len = (total - at).min(BLOCK);
+        for (b, rope) in block.iter_mut().zip(channels) {
+            read_clamped(rope, range.start + at, &mut b[..len], range.end);
+        }
+        let mut slices: Vec<&mut [f32]> = block.iter_mut().map(|b| &mut b[..len]).collect();
+        rack.process(&mut slices);
+        for (o, b) in out.iter_mut().zip(&block) {
+            o.push_samples(&b[..len]);
+        }
+        at += len;
+        progress.store((at * 1000 / total.max(1)) as u32, Relaxed);
+    }
+    for o in &mut out {
+        o.delete(0..latency.min(o.len()));
+    }
+    Some(out)
+}
+
+/// Fill `buf` from `start`, treating anything at or past `hard_end` (which may be before the
+/// rope's own length, e.g. a selection that doesn't reach the file's end) as silence.
+fn read_clamped(rope: &Rope, start: usize, buf: &mut [f32], hard_end: usize) {
+    let avail = hard_end.saturating_sub(start).min(buf.len());
+    if avail > 0 {
+        rope.read(start, &mut buf[..avail]);
+    }
+    buf[avail..].fill(0.0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +414,92 @@ mod tests {
         });
         let input = vec![0.5f32; 100];
         assert_eq!(render(&d, &input), input);
+    }
+
+    #[test]
+    fn render_rope_matches_render_offline() {
+        let desc = amp_rack(20.0 * 2f32.log10());
+        let input: Vec<f32> = (0..20_000).map(|i| (i as f32 * 0.01).sin() * 0.3).collect();
+        let mut flat = vec![input.clone()];
+        assert!(render_offline(
+            &desc,
+            &mut flat,
+            48_000.0,
+            &AtomicU32::new(0),
+            &AtomicBool::new(false)
+        ));
+
+        let ropes = vec![Rope::from_samples(&input)];
+        let out = render_rope(
+            &desc,
+            &ropes,
+            0..input.len(),
+            48_000.0,
+            &AtomicU32::new(0),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), input.len());
+        assert_eq!(out[0].to_vec(0..input.len()), flat[0]);
+    }
+
+    #[test]
+    fn render_rope_reads_only_the_selection_and_zero_pads_past_it() {
+        // A selection in the middle of a longer rope, including a region past where the
+        // selection's own end falls well short of the rope's actual length.
+        let input: Vec<f32> = (0..50_000).map(|i| i as f32).collect();
+        let ropes = vec![Rope::from_samples(&input)];
+        let out = render_rope(
+            &RackDesc::default(),
+            &ropes,
+            10_000..10_010,
+            48_000.0,
+            &AtomicU32::new(0),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(out[0].to_vec(0..10), input[10_000..10_010]);
+    }
+
+    #[test]
+    fn render_rope_can_be_cancelled() {
+        let ropes = vec![Rope::silence(200_000)];
+        let cancel = AtomicBool::new(true);
+        assert!(render_rope(
+            &amp_rack(1.0),
+            &ropes,
+            0..200_000,
+            48_000.0,
+            &AtomicU32::new(0),
+            &cancel
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn render_rope_compensates_latency() {
+        let mut d = RackDesc::single("hard_limiter").unwrap();
+        d.slots[0].as_mut().unwrap().values[2] = 10.0;
+        let input: Vec<f32> = (0..20_000)
+            .map(|i| (i as f32 * 0.003).sin() * 0.25)
+            .collect();
+        let ropes = vec![Rope::from_samples(&input)];
+        let out = render_rope(
+            &d,
+            &ropes,
+            0..input.len(),
+            48_000.0,
+            &AtomicU32::new(0),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let worst = out[0]
+            .to_vec(0..input.len())
+            .iter()
+            .zip(&input)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(worst < 1e-6, "misaligned by latency: {worst}");
     }
 }

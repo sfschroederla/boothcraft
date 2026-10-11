@@ -29,6 +29,12 @@ pub struct Shared {
     skipping: AtomicBool,
     skip_start: AtomicU64,
     skip_end: AtomicU64,
+    /// Current selection start, so the prefetch thread can keep it warm even while paused.
+    selection_hint: AtomicU64,
+    /// Times the renderer needed a block that had not finished reloading from disk and had to
+    /// substitute silence instead of blocking. A healthy session with prefetch keeping up stays at
+    /// (or very near) zero; a rising count means played-back audio is getting gaps.
+    underruns: AtomicU64,
 }
 
 impl Shared {
@@ -48,6 +54,8 @@ impl Shared {
             skipping: AtomicBool::new(false),
             skip_start: AtomicU64::new(0),
             skip_end: AtomicU64::new(0),
+            selection_hint: AtomicU64::new(0),
+            underruns: AtomicU64::new(0),
         })
     }
 
@@ -87,6 +95,31 @@ impl Shared {
         self.loop_start.store(start as u64, Relaxed);
         self.loop_end.store(end as u64, Relaxed);
         self.looping.store(enabled, Relaxed);
+    }
+
+    /// The configured loop range, regardless of whether looping is currently enabled. Used by the
+    /// prefetch thread to keep the loop point warm even before the user engages looping.
+    pub(crate) fn loop_bounds(&self) -> (usize, usize) {
+        (
+            self.loop_start.load(Relaxed) as usize,
+            self.loop_end.load(Relaxed) as usize,
+        )
+    }
+
+    /// Tell the prefetch thread where the current selection starts, so it stays warm for a
+    /// possible "play from selection" even while paused. Purely a hint: has no effect on playback.
+    pub fn set_selection_hint(&self, start: usize) {
+        self.selection_hint.store(start as u64, Relaxed);
+    }
+
+    pub(crate) fn selection_hint(&self) -> usize {
+        self.selection_hint.load(Relaxed) as usize
+    }
+
+    /// Number of times the renderer has had to substitute silence for audio that had not finished
+    /// reloading from disk. See [`crate::Prefetcher`].
+    pub fn underruns(&self) -> u64 {
+        self.underruns.load(Relaxed)
     }
 
     /// Stop playback at `frame` (when not looping), or play to the end of the file with `None`.
@@ -268,8 +301,17 @@ impl Renderer {
                 .min(total_out - produced)
                 .max(1);
             let need = ((run as f64 * step).ceil() as usize + 2).min(CHUNK + 4);
+            // `read_resident` never blocks on disk: a block the prefetch thread hasn't reloaded
+            // yet (e.g. right after a seek into evicted audio) yields silence instead of a stall.
+            let mut all_resident = true;
             for (c, buf) in self.scratch.iter_mut().enumerate().take(doc_ch) {
-                doc.channels[c].read(base, &mut buf[..need]);
+                if !doc.channels[c].read_resident(base, &mut buf[..need]) {
+                    buf[..need].fill(0.0);
+                    all_resident = false;
+                }
+            }
+            if !all_resident {
+                s.underruns.fetch_add(1, Relaxed);
             }
             let mut done = 0;
             while done < run {
@@ -539,6 +581,10 @@ mod tests {
         let got: Vec<f32> = std::iter::from_fn(|| rx.pop().ok()).collect();
         assert_eq!(got, out);
     }
+
+    // See `tests/renderer_underrun.rs` for the eviction/silence/underrun-counting test: it depends
+    // on the real (process-wide) block store's memory budget, so it needs its own process rather
+    // than sharing this binary's global store with every other unit test here.
 
     #[test]
     fn meters_report_and_reset() {

@@ -14,20 +14,21 @@ fn extended(rate: u32) -> [u8; 10] {
     out
 }
 
-/// Write big-endian integer PCM AIFF. `samples` are interleaved, already in `[-1, 1]`.
+/// Write big-endian integer PCM AIFF. `samples` yields exactly `frames * channels` interleaved
+/// values already in `[-1, 1]`, pulled on demand rather than needing them all in memory at once.
 pub fn write_aiff<W: Write>(
     w: &mut W,
     rate: u32,
     channels: usize,
     bits: u16,
-    samples: &[f32],
+    frames: usize,
+    samples: impl Iterator<Item = f32>,
 ) -> Result<()> {
     if !matches!(bits, 8 | 16 | 24 | 32) {
         return Err(Error::Encode(format!("AIFF does not support {bits}-bit")));
     }
     let bytes = (bits / 8) as usize;
-    let frames = samples.len() / channels;
-    let data_len = samples.len() * bytes;
+    let data_len = frames * channels * bytes;
     let pad = data_len % 2;
     let form_len = 4 + (8 + 18) + (8 + 8 + data_len + pad);
     w.write_all(b"FORM")?;
@@ -43,11 +44,18 @@ pub fn write_aiff<W: Write>(
     w.write_all(&((data_len + 8) as u32).to_be_bytes())?;
     w.write_all(&[0u8; 8])?;
     let max = (1i64 << (bits - 1)) as f32;
-    for &s in samples {
+    let mut written = 0usize;
+    for s in samples {
         let v = (s.clamp(-1.0, 1.0) * max).round().clamp(-max, max - 1.0) as i32;
         let be = v.to_be_bytes();
         w.write_all(&be[4 - bytes..])?;
+        written += 1;
     }
+    debug_assert_eq!(
+        written,
+        frames * channels,
+        "the sample iterator must yield exactly frames * channels values"
+    );
     if pad == 1 {
         w.write_all(&[0])?;
     }

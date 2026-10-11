@@ -8,7 +8,7 @@ mod decode;
 mod encode;
 mod riff;
 
-pub use decode::read;
+pub use decode::{read, read_with_progress};
 pub use encode::{write, BitDepth, Format, WriteOptions};
 pub use riff::{append_markers, read_markers};
 

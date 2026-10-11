@@ -1,3 +1,4 @@
+use crate::prefetch::Prefetcher;
 use crate::rackctl::{rack_channel, RackControl, RackLink};
 use crate::shared::{Renderer, Shared};
 use boothcraft_core::Document;
@@ -19,6 +20,8 @@ pub enum EngineError {
 pub struct Engine {
     shared: Arc<Shared>,
     _stream: Stream,
+    /// Kept alive for the engine's lifetime; stops its thread on drop.
+    _prefetcher: Prefetcher,
     rack: Option<RackControl>,
     tap: Option<Tap>,
     pub device_name: String,
@@ -78,9 +81,11 @@ impl Engine {
         stream
             .play()
             .map_err(|e| EngineError::Device(e.to_string()))?;
+        let prefetcher = Prefetcher::spawn(shared.clone());
         Ok(Engine {
             shared,
             _stream: stream,
+            _prefetcher: prefetcher,
             rack: Some(rack),
             tap: Some(Tap {
                 consumer: tap_rx,

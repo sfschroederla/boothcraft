@@ -11,6 +11,7 @@ mod ops;
 mod param_ui;
 mod scale;
 mod selview_panel;
+mod spectral;
 mod view;
 mod waveform;
 

@@ -9,6 +9,8 @@ workspace = true
 
 [dependencies]
 thiserror.workspace = true
+arc-swap = "1"
+directories = "6"
 
 [dev-dependencies]
 proptest.workspace = true

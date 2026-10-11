@@ -98,3 +98,46 @@ fn export_resamples_and_dithers() {
     assert_eq!(back.frames(), 44_100);
     assert_eq!(back.markers[0].at, 22_050, "marker keeps its time");
 }
+
+#[test]
+fn streaming_decode_reports_progress_and_handles_many_packets() {
+    // Large enough that symphonia's WAV reader emits many packets, not just one, so this
+    // exercises the streaming decoder's packet-by-packet accumulation across a real multi-packet
+    // file, not just a single pass.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.wav");
+    let doc = sine(2_000_000, 48_000);
+    write(
+        &doc,
+        &path,
+        &WriteOptions::new(Format::Wav, BitDepth::Float32),
+    )
+    .unwrap();
+
+    let mut calls = 0usize;
+    let mut last_frames = 0usize;
+    let mut saw_declared_len = false;
+    let back = read_with_progress(&path, |frames, declared| {
+        calls += 1;
+        assert!(frames >= last_frames, "progress must not go backwards");
+        last_frames = frames;
+        if let Some(n) = declared {
+            saw_declared_len = true;
+            assert!(frames <= n, "never reports more than the declared length");
+        }
+    })
+    .unwrap();
+
+    assert!(
+        calls > 1,
+        "a 2,000,000-frame file should decode in more than one packet"
+    );
+    assert!(saw_declared_len, "WAV reports its frame count up front");
+    assert_eq!(
+        last_frames,
+        doc.frames(),
+        "final progress call reaches the full length"
+    );
+    assert_eq!(back.frames(), doc.frames());
+    assert!(max_err(&doc, &back) <= 1e-6);
+}

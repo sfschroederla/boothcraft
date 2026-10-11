@@ -62,7 +62,7 @@ impl Rope {
             if room > 0 && !samples.is_empty() {
                 let take = room.min(samples.len());
                 let mut merged = Vec::with_capacity(last.len() + take);
-                merged.extend_from_slice(last.samples());
+                merged.extend_from_slice(&last.data());
                 merged.extend_from_slice(&samples[..take]);
                 self.len -= last.len();
                 self.blocks.pop();
@@ -100,7 +100,7 @@ impl Rope {
             if from == 0 && to == b.len() {
                 out.push_block(b.clone());
             } else {
-                out.push_block(Block::new(b.samples()[from..to].to_vec()));
+                out.push_block(Block::new(b.data()[from..to].to_vec()));
             }
         }
         out
@@ -141,7 +141,7 @@ impl Rope {
         *self = out;
     }
 
-    /// Copy `range` into a contiguous vector.
+    /// Copy `range` into a contiguous vector. Loads from disk as needed; not real-time safe.
     pub fn to_vec(&self, range: Range<usize>) -> Vec<f32> {
         let mut v = vec![0.0; range.end.min(self.len).saturating_sub(range.start)];
         self.read(range.start, &mut v);
@@ -149,6 +149,9 @@ impl Rope {
     }
 
     /// Fill `out` from frame `start`; frames past the end are zero. Returns frames copied.
+    ///
+    /// Loads spilled blocks from disk as needed, so this can block on file I/O: not real-time
+    /// safe. See [`Rope::read_resident`] for a non-blocking alternative.
     pub fn read(&self, start: usize, out: &mut [f32]) -> usize {
         let mut pos = 0;
         let mut copied = 0;
@@ -164,14 +167,63 @@ impl Rope {
             }
             let (from, to) = (start.max(bs) - bs, end.min(be) - bs);
             let dst = start.max(bs) - start;
-            out[dst..dst + (to - from)].copy_from_slice(&b.samples()[from..to]);
+            out[dst..dst + (to - from)].copy_from_slice(&b.data()[from..to]);
             copied += to - from;
         }
         out[copied..].fill(0.0);
         copied
     }
 
-    /// Summarise `range` into `columns` peaks. Uses block overviews when columns are wide.
+    /// Like [`Rope::read`], but never touches disk: fills `out` and returns `true` only if every
+    /// block overlapping `start..start+out.len()` is already resident in memory. Otherwise it
+    /// returns `false` immediately (without blocking) and `out`'s contents are unspecified.
+    ///
+    /// Lock-free and wait-free: safe to call from the real-time audio callback.
+    pub fn read_resident(&self, start: usize, out: &mut [f32]) -> bool {
+        let mut pos = 0;
+        let end = start + out.len();
+        for b in &self.blocks {
+            let (bs, be) = (pos, pos + b.len());
+            pos = be;
+            if be <= start {
+                continue;
+            }
+            if bs >= end {
+                break;
+            }
+            let Some(data) = b.try_data() else {
+                return false;
+            };
+            let (from, to) = (start.max(bs) - bs, end.min(be) - bs);
+            let dst = start.max(bs) - start;
+            out[dst..dst + (to - from)].copy_from_slice(&data[from..to]);
+        }
+        true
+    }
+
+    /// Call `f` with each contiguous run of `range`'s samples, one block at a time, instead of
+    /// collecting the whole range into memory first. Loads from disk as needed; not real-time safe.
+    pub fn for_each_chunk(&self, range: Range<usize>, mut f: impl FnMut(&[f32])) {
+        let end = range.end.min(self.len);
+        let start = range.start.min(end);
+        let mut pos = 0;
+        for b in &self.blocks {
+            let (bs, be) = (pos, pos + b.len());
+            pos = be;
+            if be <= start {
+                continue;
+            }
+            if bs >= end {
+                break;
+            }
+            let (from, to) = (start.max(bs) - bs, end.min(be) - bs);
+            let data = b.data();
+            f(&data[from..to]);
+        }
+    }
+
+    /// Summarise `range` into `columns` peaks. Uses block overviews when columns are wide, and a
+    /// whole block's own summary when a column spans it entirely.
     pub fn peaks(&self, range: Range<usize>, columns: usize) -> Vec<Peak> {
         let end = range.end.min(self.len);
         let start = range.start.min(end);
@@ -201,6 +253,17 @@ impl Rope {
             }
             let (from, to) = (start.max(bs), end.min(be));
             if use_overview {
+                // Fast path: a whole block mapping entirely inside one output column needs only
+                // its precomputed summary, not a walk over every `PEAK_STRIDE` cell.
+                if from == bs && to == be {
+                    let first_col = (((bs - start) as f64) / per_col) as usize;
+                    let last_col = ((((be - 1) - start) as f64) / per_col) as usize;
+                    if first_col == last_col {
+                        add(first_col, b.summary(), b.len());
+                        continue;
+                    }
+                }
+                let data = b.data();
                 let mut f = from;
                 while f < to {
                     let cell = (f - bs) / PEAK_STRIDE;
@@ -211,18 +274,19 @@ impl Rope {
                     let p = if whole {
                         b.peaks()[cell]
                     } else {
-                        Peak::of(&b.samples()[f - bs..cell_end - bs])
+                        Peak::of(&data[f - bs..cell_end - bs])
                     };
                     add(col, p, cell_end - f);
                     f = cell_end;
                 }
             } else {
+                let data = b.data();
                 let mut f = from;
                 while f < to {
                     let col = (((f - start) as f64) / per_col) as usize;
                     let col_end = (start as f64 + (col as f64 + 1.0) * per_col).ceil() as usize;
                     let stop = col_end.clamp(f + 1, to);
-                    add(col, Peak::of(&b.samples()[f - bs..stop - bs]), stop - f);
+                    add(col, Peak::of(&data[f - bs..stop - bs]), stop - f);
                     f = stop;
                 }
             }

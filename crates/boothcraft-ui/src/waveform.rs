@@ -1,5 +1,6 @@
 use crate::ops::OpenFile;
 use crate::scale::{self, AmpUnits, TimeFormat};
+use crate::spectral::{self, ViewMode};
 use crate::view::{self, edge_drag_anchor, extend_anchor, View};
 use boothcraft_core::{fade_gain, FadeShape, Selection, ZeroDir};
 use egui::{pos2, vec2, Color32, CursorIcon, Pos2, Rect, Sense, Shape, Stroke, Ui};
@@ -37,6 +38,7 @@ pub struct DisplayOptions {
     pub snap: SnapOptions,
     pub tempo_bpm: f32,
     pub beats_per_bar: u32,
+    pub spectral: crate::spectral::SpectralOptions,
 }
 
 impl Default for DisplayOptions {
@@ -47,6 +49,7 @@ impl Default for DisplayOptions {
             snap: SnapOptions::default(),
             tempo_bpm: 120.0,
             beats_per_bar: 4,
+            spectral: crate::spectral::SpectralOptions::default(),
         }
     }
 }
@@ -235,6 +238,29 @@ pub fn show(
     }
 
     let view = file.view;
+    if opts.spectral.mode.needs_render() {
+        let channel_count = file.doc().channel_count().max(1);
+        let lane_h = lanes.height() / channel_count as f32;
+        let render_h = if opts.spectral.mode == ViewMode::Split {
+            lane_h / 2.0
+        } else {
+            lane_h
+        };
+        let channels_snapshot = file.doc().channels.clone();
+        let (revision, mask) = (file.revision, file.mask);
+        spectral::ensure(
+            &mut file.spectrogram,
+            ui.ctx(),
+            channels_snapshot,
+            revision,
+            rate,
+            mask,
+            &view,
+            &opts.spectral,
+            lanes.width().floor() as usize,
+            render_h as usize,
+        );
+    }
     let painter = ui.painter_at(outer);
     painter.rect_filled(lanes, 0.0, BACKGROUND);
     let ticks = scale::time_ticks(&view, width, rate, opts.time, LABEL_PX);
@@ -250,10 +276,14 @@ pub fn show(
     draw_strip(&painter, strip, file, &view, opts);
     draw_channel_buttons(&painter, chan_col, file);
     draw_ruler(&painter, ruler, &view, &ticks, opts);
+    let strip_unit = match opts.spectral.mode {
+        ViewMode::Frequency | ViewMode::Pitch => "Hz",
+        ViewMode::Waveform | ViewMode::Split => opts.amp.short(),
+    };
     painter.text(
         pos2(strip.left() + 6.0, ruler.bottom() - 3.0),
         egui::Align2::LEFT_BOTTOM,
-        opts.amp.short(),
+        strip_unit,
         egui::FontId::proportional(10.0),
         Color32::LIGHT_GRAY,
     );
@@ -928,12 +958,22 @@ fn draw_strip(p: &egui::Painter, strip: Rect, file: &OpenFile, v: &View, opts: &
                 text,
             );
         };
-        for g in scale::amp_gridlines(opts.amp, v.amp, half, 18.0) {
-            let dy = g.value * v.amp * half;
-            put(mid - dy, &g.label);
-            put(mid + dy, &g.label);
+        if opts.spectral.mode == ViewMode::Frequency || opts.spectral.mode == ViewMode::Pitch {
+            for (row, label) in spectral::hz_gridlines(
+                opts.spectral.freq_axis,
+                lane.height() as usize,
+                file.doc().sample_rate,
+            ) {
+                put(lane.top() + row, &label);
+            }
+        } else {
+            for g in scale::amp_gridlines(opts.amp, v.amp, half, 18.0) {
+                let dy = g.value * v.amp * half;
+                put(mid - dy, &g.label);
+                put(mid + dy, &g.label);
+            }
+            put(mid, scale::zero_label(opts.amp));
         }
-        put(mid, scale::zero_label(opts.amp));
         if c > 0 {
             p.line_segment(
                 [lane.left_top(), lane.right_top()],
@@ -970,7 +1010,36 @@ fn draw_lanes(
     }
 
     for (c, rope) in doc.channels.iter().enumerate() {
-        let lane = lane_rect(lanes, c, n);
+        let full_lane = lane_rect(lanes, c, n);
+        if opts.spectral.mode == ViewMode::Frequency || opts.spectral.mode == ViewMode::Pitch {
+            spectral::draw(p, full_lane, file, c, &opts.spectral, v);
+            if c > 0 {
+                p.line_segment(
+                    [full_lane.left_top(), full_lane.right_top()],
+                    Stroke::new(1.0, Color32::from_gray(70)),
+                );
+            }
+            continue;
+        }
+        let split_spec_rect = (opts.spectral.mode == ViewMode::Split).then(|| {
+            Rect::from_min_max(pos2(full_lane.left(), full_lane.center().y), full_lane.max)
+        });
+        if let Some(spec_rect) = split_spec_rect {
+            spectral::draw(
+                &p.with_clip_rect(full_lane),
+                spec_rect,
+                file,
+                c,
+                &opts.spectral,
+                v,
+            );
+        }
+        let lane = match split_spec_rect {
+            Some(_) => {
+                Rect::from_min_max(full_lane.min, pos2(full_lane.right(), full_lane.center().y))
+            }
+            None => full_lane,
+        };
         let p = p.with_clip_rect(lane);
         let mid = lane.center().y;
         let half = lane.height() * 0.5 - 2.0;

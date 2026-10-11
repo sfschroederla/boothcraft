@@ -30,9 +30,20 @@ built and unit-tested but not yet exercised by a person in the running app.
 | Skip Selection | done | plays around the selection (at least 2 s each side) |
 | Rewind / fast-forward | done | hold to scrub at 4x |
 | Recording, punch-in over a selection | done, unverified | default input device only; live device capture not yet tested by a person |
+| Recording, long takes | known follow-up | the live preview appends small chunks to a rope on every poll; `Rope::push_samples`'s top-up of a partial block re-copies that whole block each call, so very long unbroken takes get incrementally slower (the same root cause fixed for file decode in D3, by batching before pushing; recording wasn't revisited) |
 | Level meters with peak hold, phase meter | done | input level shown while recording |
 | Edit > Convert Sample Type (rate, mono/stereo) | done | |
-| Disk-backed block store | todo | all audio is held in RAM today |
+| Disk-backed block store, memory budget | done | spills least-recently-used blocks past a budget (default 1 GB); verified in the running app |
+| Playback prefetch, no audio-thread disk I/O | done | renderer uses a non-blocking read; outputs silence + counts an underrun on a miss instead of stalling |
+| Streaming decode (open) | done | pushes packets straight into blocks; verified on a 3.7GB WAV: peak memory is a bounded multiple of the budget, not the file size |
+| Streaming encode: WAV, AIFF | done | both pull chunks from the ropes; peak memory tracks the already-open document, not an extra full-file copy |
+| Streaming encode: FLAC (input side) | done | custom `flacenc::source::Source` reads from the ropes in blocks |
+| Streaming encode: FLAC (output side) | known limitation | `flacenc` 0.4's own `Stream`/`ByteSink` buffer the whole compressed output in RAM before the final write, roughly doubling peak memory for FLAC exports specifically; WAV/AIFF are unaffected |
+| Apply via the Effects Rack | done | reads/writes directly through ropes in chunks (`render_rope`), splices the result in; a selection spanning a huge file is never copied into one flat buffer |
+| Apply via offline effects (Normalize, Envelopes) and Match Loudness | partial | still materialize the selected range as flat buffers up front (needed for their own whole-range analysis); bounded by selection size, not by two-pass chunked streaming |
+| Decode/encode self-throttling against the spiller | done | a fast decode (e.g. WAV) can outrun the background spiller's own pace; decode periodically waits for it to catch up rather than racing arbitrarily far ahead |
+| Preferences: memory budget, disk cache location | done, unverified | Edit > Preferences; cache path shown read-only |
+| Status bar: resident / disk MB | done, unverified | always visible, right side of the status bar |
 
 ## M2: effects
 | Feature | Status | Notes |
@@ -57,5 +68,13 @@ built and unit-tested but not yet exercised by a person in the running app.
 | Convolution Reverb, Full Reverb, Surround Reverb | todo | M5 |
 | FFT Filter, Graphic Phase Shifter, Stereo Expander, time/pitch | todo | M5 |
 
-## M3–M7
-Spectral display, noise reduction, analysis, batch, plugin hosting and packaging are all `todo`.
+## M3: spectral editing
+| Feature | Status | Notes |
+|---|---|---|
+| STFT framework (`boothcraft-dsp::stft`) | done | `StftProcessor`: Hann window, 75% overlap, overlap-add synthesis; `SpectralFrame` trait for per-frame spectral effects; `SpectralEffect<T>` wraps one as a normal `Effect` so it works in the rack with latency reported |
+| Spectral frequency/pitch views | done, unverified | View menu: Waveform / Spectral Frequency / Spectral Pitch / Split, Shift+D toggles Waveform/Frequency; one FFT per pixel column (`SpectrumAnalyzer`, 256–8192, Hann or Blackman-Harris), computed per channel on a worker thread and uploaded as an egui texture, last image stays on screen while a new one computes; log/linear Hz axis strip, Fire/Grayscale colour maps, adjustable dB floor, all in the View > Spectral Settings submenu; Pitch mode overlays a YIN-tracked pitch curve. Verified end-to-end (non-black image, correct pitch) against synthetic audio in an automated test; not yet looked at by a person in the running app |
+| Spectral selection tools and healing | todo | |
+| Diagnostics panel | todo | |
+
+## M4–M7
+Analysis, batch, plugin hosting and packaging are all `todo`.

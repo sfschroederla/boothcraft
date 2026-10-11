@@ -538,6 +538,8 @@ dependencies = [
 name = "boothcraft-core"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "directories",
  "proptest",
  "thiserror 2.0.21",
 ]
@@ -551,6 +553,7 @@ dependencies = [
  "boothcraft-core",
  "directories",
  "ebur128",
+ "realfft",
  "rubato",
  "serde",
  "serde_json",

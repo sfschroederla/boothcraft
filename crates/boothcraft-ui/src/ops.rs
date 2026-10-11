@@ -46,6 +46,9 @@ pub struct OpenFile {
     pub save_options: Option<boothcraft_io::WriteOptions>,
     /// Live, uncommitted audio shown while recording.
     pub preview: Option<Document>,
+    /// The spectral view's last rendered image(s), kept across frames so the last one stays on
+    /// screen while a new one computes.
+    pub spectrogram: crate::spectral::SpectrogramCache,
 }
 
 impl OpenFile {
@@ -67,6 +70,7 @@ impl OpenFile {
             view_width_px: 0.0,
             save_options: None,
             preview: None,
+            spectrogram: crate::spectral::SpectrogramCache::default(),
         }
     }
 

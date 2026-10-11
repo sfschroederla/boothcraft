@@ -9,10 +9,12 @@ use crate::meters::Meters;
 use crate::ops::{OpenFile, ZeroAdjust};
 use crate::scale;
 use crate::selview_panel::SelViewPanel;
+use crate::spectral::{self, ColorMap, FreqAxis, ViewMode};
 use crate::view::format_time;
 use crate::waveform;
 use boothcraft_core::{Clipboards, Document, Rope, Selection};
 use boothcraft_dsp::convert::Downmix;
+use boothcraft_dsp::StftWindow;
 use boothcraft_engine::{Engine, Recorder, Shared, Take};
 use boothcraft_io::{BitDepth, Format, WriteOptions};
 use egui::{Event, Key, KeyboardShortcut, Modifiers};
@@ -57,6 +59,7 @@ enum Dialog {
     Preferences {
         preroll: f64,
         postroll: f64,
+        memory_budget_mb: u64,
     },
     SaveAs {
         path: PathBuf,
@@ -138,10 +141,13 @@ struct State {
 pub struct BoothcraftApp {
     dock: DockState<Tab>,
     state: State,
+    /// Removes the disk-backed block store's segment directory when the app closes.
+    _cleanup: boothcraft_core::CleanupGuard,
 }
 
 impl BoothcraftApp {
     pub fn new(_cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> BoothcraftApp {
+        let cleanup = boothcraft_core::install_cleanup_guard();
         // Editor on top; Selection/View, Phase Meter and Levels side by side underneath. The split
         // fraction is the share kept by the *existing* node.
         let mut dock = DockState::new(vec![Tab::Editor]);
@@ -200,7 +206,11 @@ impl BoothcraftApp {
         for p in paths {
             state.open(&p);
         }
-        BoothcraftApp { dock, state }
+        BoothcraftApp {
+            dock,
+            state,
+            _cleanup: cleanup,
+        }
     }
 }
 
@@ -336,6 +346,9 @@ impl State {
             shared.set_loop(false, 0, 0);
         }
         shared.set_skip(self.skip_selection && !self.looping, sel.start, sel.end);
+        // Lets the playback prefetch thread keep the selection start warm even while paused, in
+        // case the user presses Play next.
+        shared.set_selection_hint(sel.start);
     }
 
     fn effect_action(&mut self, action: EffectAction) {
@@ -663,6 +676,7 @@ impl State {
         let end = !typing && keys(Modifiers::NONE, Key::End);
         let add_marker = !typing && keys(Modifiers::NONE, Key::M);
         let toggle_snap = !typing && keys(Modifiers::NONE, Key::S);
+        let toggle_view_mode = !typing && keys(Modifiers::SHIFT, Key::D);
         let clips = &mut self.clips;
         if let Some(f) = self.files.get_mut(self.active) {
             if select_all {
@@ -696,6 +710,15 @@ impl State {
                     "off"
                 }
             );
+        }
+        if toggle_view_mode {
+            let spectral = &mut self.display.spectral;
+            spectral.mode = if spectral.mode == ViewMode::Waveform {
+                ViewMode::Frequency
+            } else {
+                ViewMode::Waveform
+            };
+            self.status = format!("View: {}", spectral.mode.name());
         }
         if add_marker {
             if let Some(f) = self.files.get_mut(self.active) {
@@ -836,6 +859,7 @@ impl State {
                     self.dialog = Some(Dialog::Preferences {
                         preroll: self.preroll_secs,
                         postroll: self.postroll_secs,
+                        memory_budget_mb: boothcraft_core::BlockStore::global().budget_mb(),
                     });
                     ui.close();
                 }
@@ -850,6 +874,64 @@ impl State {
                             ui.close();
                         }
                     }
+                });
+            });
+            ui.menu_button("View", |ui| {
+                for mode in ViewMode::ALL {
+                    if ui
+                        .radio(self.display.spectral.mode == mode, mode.name())
+                        .clicked()
+                    {
+                        self.display.spectral.mode = mode;
+                        ui.close();
+                    }
+                }
+                ui.separator();
+                ui.menu_button("Spectral Settings", |ui| {
+                    let spectral = &mut self.display.spectral;
+                    ui.horizontal(|ui| {
+                        ui.label("FFT size:");
+                        egui::ComboBox::new("spectral_fft_size", "")
+                            .selected_text(spectral.fft_size.to_string())
+                            .show_ui(ui, |ui| {
+                                for size in spectral::FFT_SIZES {
+                                    ui.selectable_value(
+                                        &mut spectral.fft_size,
+                                        size,
+                                        size.to_string(),
+                                    );
+                                }
+                            });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Window:");
+                        ui.radio_value(&mut spectral.window, StftWindow::Hann, "Hann");
+                        ui.radio_value(
+                            &mut spectral.window,
+                            StftWindow::BlackmanHarris,
+                            "Blackman-Harris",
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Colors:");
+                        for m in ColorMap::ALL {
+                            ui.radio_value(&mut spectral.color_map, m, m.name());
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Frequency axis:");
+                        for a in FreqAxis::ALL {
+                            ui.radio_value(&mut spectral.freq_axis, a, a.name());
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("dB range:");
+                        ui.add(
+                            egui::DragValue::new(&mut spectral.db_floor)
+                                .range(-140.0..=-20.0)
+                                .suffix(" dB"),
+                        );
+                    });
                 });
             });
             ui.add_enabled_ui(has, |ui| {
@@ -1057,13 +1139,25 @@ impl State {
                             ui.end_row();
                         });
                     }
-                    Dialog::Preferences { preroll, postroll } => {
+                    Dialog::Preferences { preroll, postroll, memory_budget_mb } => {
                         egui::Grid::new("prefs").num_columns(2).show(ui, |ui| {
                             ui.label("Pre-roll (s)");
                             ui.add(egui::DragValue::new(preroll).range(0.0..=30.0).speed(0.05));
                             ui.end_row();
                             ui.label("Post-roll (s)");
                             ui.add(egui::DragValue::new(postroll).range(0.0..=30.0).speed(0.05));
+                            ui.end_row();
+                            ui.label("Memory budget (MB)").on_hover_text(
+                                "Audio beyond this is spilled to a disk cache and reloaded as needed, so very long or large files stay editable.",
+                            );
+                            ui.add(egui::DragValue::new(memory_budget_mb).range(64..=65536).speed(16));
+                            ui.end_row();
+                            ui.label("Disk cache");
+                            ui.label(
+                                egui::RichText::new(boothcraft_core::BlockStore::global().cache_dir().display().to_string())
+                                    .weak()
+                                    .small(),
+                            );
                             ui.end_row();
                         });
                     }
@@ -1076,9 +1170,14 @@ impl State {
             });
         if apply {
             match self.dialog.take() {
-                Some(Dialog::Preferences { preroll, postroll }) => {
+                Some(Dialog::Preferences {
+                    preroll,
+                    postroll,
+                    memory_budget_mb,
+                }) => {
                     self.preroll_secs = preroll;
                     self.postroll_secs = postroll;
+                    boothcraft_core::BlockStore::global().set_budget_mb(memory_budget_mb);
                 }
                 Some(Dialog::SaveAs { path, opts }) => self.write_file(path, opts),
                 Some(Dialog::NewFile { rate, channels }) => self.new_file(rate, channels),
@@ -1521,7 +1620,22 @@ impl eframe::App for BoothcraftApp {
 
         egui::Panel::top("menu").show(ui, |ui| self.state.menu(ui, &mut self.dock));
         egui::Panel::bottom("status").show(ui, |ui| {
-            ui.label(&self.state.status);
+            ui.horizontal(|ui| {
+                ui.label(&self.state.status);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let store = boothcraft_core::BlockStore::global();
+                    let mb = |b: u64| b / (1024 * 1024);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} MB resident, {} MB on disk",
+                            mb(store.resident_bytes()),
+                            mb(store.disk_bytes())
+                        ))
+                        .weak()
+                        .small(),
+                    );
+                });
+            });
         });
         egui::CentralPanel::default().show(ui, |ui| {
             DockArea::new(&mut self.dock)

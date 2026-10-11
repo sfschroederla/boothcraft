@@ -8,6 +8,7 @@ pub mod history;
 pub mod marker;
 pub mod rope;
 pub mod selection;
+pub mod store;
 
 pub use block::{Block, Peak, BLOCK_FRAMES, PEAK_STRIDE};
 pub use clipboard::Clipboards;
@@ -17,3 +18,4 @@ pub use history::History;
 pub use marker::{Marker, MarkerKind};
 pub use rope::Rope;
 pub use selection::Selection;
+pub use store::{install_cleanup_guard, BlockStore, CleanupGuard};

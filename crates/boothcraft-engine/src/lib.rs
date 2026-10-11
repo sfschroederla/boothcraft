@@ -4,12 +4,14 @@
 //! [`arc_swap::ArcSwapOption`] holding the current document snapshot.
 
 mod device;
+mod prefetch;
 mod rackctl;
 mod recorder;
 mod shared;
 mod take;
 
 pub use device::{Engine, EngineError, Tap};
+pub use prefetch::Prefetcher;
 pub use rackctl::{rack_channel, RackControl, RackLink, RackMsg};
 pub use recorder::Recorder;
 pub use shared::{Renderer, Shared};
