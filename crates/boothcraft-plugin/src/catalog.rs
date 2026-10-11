@@ -7,16 +7,20 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
     by_id: BTreeMap<String, PluginDescriptor>,
+    /// Plugins added directly (bundled with a format, or registered by tests), which a refresh
+    /// from the scan cache must not drop.
+    pinned: BTreeMap<String, PluginDescriptor>,
     /// Bumped whenever the contents change, so menus know when to rebuild.
     pub generation: u64,
 }
 
 impl Catalog {
-    /// Rebuild from the cache, leaving out disabled plugins.
+    /// Rebuild from the cache and the pinned plugins, leaving out disabled ones.
     pub fn refresh(&mut self, cache: &ScanCache, disabled: &BTreeSet<String>) {
         let by_id: BTreeMap<_, _> = cache
             .descriptors()
             .map(|d| (d.effect_id(), d.clone()))
+            .chain(self.pinned.clone())
             .filter(|(id, _)| !disabled.contains(id))
             .collect();
         if by_id != self.by_id {
@@ -25,7 +29,9 @@ impl Catalog {
         }
     }
 
+    /// Add a plugin that no scan provides; it stays through refreshes.
     pub fn insert(&mut self, d: PluginDescriptor) {
+        self.pinned.insert(d.effect_id(), d.clone());
         self.by_id.insert(d.effect_id(), d);
         self.generation += 1;
     }

@@ -174,10 +174,13 @@ fn a_restart_requested_from_inside_load_state_is_handled() {
 
 #[test]
 fn missing_plugins_pass_audio_and_are_reported() {
+    // `uninstalled` is not among the mock format's bundled plugins.
     let (mut m, _) = setup(&[]);
-    let desc = rack_with(vec![slot("gain")]);
+    let desc = rack_with(vec![slot("uninstalled")]);
     let mut b = m.build_preview(&desc, &cfg(1, 64));
-    assert!(matches!(b.errors.as_slice(), [(0, SlotError::Missing(id))] if id == "mock:gain"));
+    assert!(
+        matches!(b.errors.as_slice(), [(0, SlotError::Missing(id))] if id == "mock:uninstalled")
+    );
     assert_eq!(run(&mut b.rack, &[0.5; 8]), vec![0.5; 8]);
 }
 

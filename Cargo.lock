@@ -531,6 +531,7 @@ dependencies = [
 name = "boothcraft-app"
 version = "0.1.0"
 dependencies = [
+ "boothcraft-plugin",
  "boothcraft-ui",
  "eframe",
 ]
@@ -543,7 +544,9 @@ dependencies = [
  "boothcraft-core",
  "boothcraft-dsp",
  "boothcraft-io",
+ "boothcraft-plugin",
  "clap",
+ "serde_json",
 ]
 
 [[package]]
@@ -618,6 +621,7 @@ dependencies = [
  "boothcraft-dsp",
  "boothcraft-engine",
  "boothcraft-io",
+ "boothcraft-plugin",
  "eframe",
  "egui",
  "egui_dock",

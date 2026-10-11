@@ -7,6 +7,14 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["plugins"]
+# Hosting third-party plugins. Format backends (VST3, AudioUnit) are added under this feature.
+plugins = ["dep:boothcraft-plugin"]
+# Also builds the in-process fake plugin format, enabled at run time with BOOTHCRAFT_PLUGINS=mock.
+mock-plugins = ["plugins", "boothcraft-plugin/mock"]
+
 [dependencies]
 boothcraft-ui.workspace = true
+boothcraft-plugin = { workspace = true, optional = true }
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "persistence"] }

@@ -121,6 +121,13 @@ impl PluginFormat for MockFormat {
         out
     }
 
+    fn bundled(&self) -> Vec<PluginDescriptor> {
+        ["gain", "gain-stereo", "delay:64"]
+            .iter()
+            .map(|u| descriptor(u))
+            .collect()
+    }
+
     fn needs_probe(&self) -> bool {
         true
     }

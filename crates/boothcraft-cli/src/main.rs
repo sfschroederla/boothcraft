@@ -42,6 +42,12 @@ enum Command {
     },
     /// Print format, length and level information.
     Info { file: PathBuf },
+    /// Find and list third-party plugins.
+    #[cfg(feature = "plugins")]
+    Plugins {
+        #[command(subcommand)]
+        action: PluginsCommand,
+    },
     /// Convert between WAV, AIFF and FLAC (chosen by output extension).
     Convert {
         input: PathBuf,
@@ -55,6 +61,76 @@ enum Command {
         #[arg(long)]
         dither: bool,
     },
+}
+
+#[cfg(feature = "plugins")]
+#[derive(Subcommand)]
+enum PluginsCommand {
+    /// Scan for plugins (each in its own child process) and update the cache.
+    Scan,
+    /// List the plugins found by the last scan.
+    List {
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// The plugin formats this build can host.
+#[cfg(feature = "plugins")]
+fn plugin_formats() -> Vec<Box<dyn boothcraft_plugin::PluginFormat>> {
+    #[allow(unused_mut)]
+    let mut formats: Vec<Box<dyn boothcraft_plugin::PluginFormat>> = Vec::new();
+    #[cfg(feature = "mock-plugins")]
+    if std::env::var("BOOTHCRAFT_PLUGINS").is_ok_and(|v| v == "mock") {
+        formats.push(Box::new(boothcraft_plugin::mock::MockFormat::new()));
+    }
+    formats
+}
+
+#[cfg(feature = "plugins")]
+fn plugins_command(action: PluginsCommand) -> Result<()> {
+    use boothcraft_plugin::{MainThread, PluginManager, ScanConfig, WorkerCommand};
+    let mut manager = PluginManager::new(
+        MainThread::init(),
+        plugin_formats(),
+        boothcraft_plugin::settings::default_dir(),
+        std::sync::Arc::new(|| {}),
+    );
+    match action {
+        PluginsCommand::Scan => {
+            let cfg = ScanConfig::new(WorkerCommand::current_exe()?);
+            let r = manager.scan_blocking(&cfg);
+            println!(
+                "probed {}, cached {}, found {} plugin(s)",
+                r.probed, r.cached, r.found
+            );
+            for p in &r.blocked {
+                println!("blocked (crashed or hung while scanning): {}", p.display());
+            }
+            for (p, why) in &r.invalid {
+                println!("skipped {}: {why}", p.display());
+            }
+        }
+        PluginsCommand::List { json } => {
+            let all: Vec<_> = manager.catalog().all().collect();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&all)?);
+            } else {
+                for d in all {
+                    println!(
+                        "{} - {} ({}) [{}]",
+                        d.effect_id(),
+                        d.name,
+                        d.vendor,
+                        d.path.display()
+                    );
+                }
+            }
+        }
+    }
+    manager.shutdown(Vec::new());
+    Ok(())
 }
 
 fn parse_kv(s: &str) -> Result<(String, f32), String> {
@@ -118,10 +194,15 @@ fn apply_effect(
 }
 
 fn main() -> Result<()> {
+    // Hidden mode: `--plugin-scan-worker <format> <path>` probes one plugin file and exits.
+    #[cfg(feature = "plugins")]
+    boothcraft_plugin::maybe_run_scan_worker(&plugin_formats());
     // Removes the disk-backed block store's segment directory when this function returns,
     // including on an early `?` return.
     let _cleanup = boothcraft_core::install_cleanup_guard();
     match Cli::parse().command {
+        #[cfg(feature = "plugins")]
+        Command::Plugins { action } => plugins_command(action)?,
         Command::Effects => {
             for info in boothcraft_dsp::registry::EFFECTS {
                 let specs = boothcraft_dsp::registry::specs(info.id).unwrap_or(&[]);

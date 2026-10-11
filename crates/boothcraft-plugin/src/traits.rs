@@ -145,6 +145,12 @@ pub trait PluginFormat: Send + Sync {
     /// Files to consider, in the format's standard locations plus `extra`. Never loads plugin code.
     fn discover(&self, extra: &[PathBuf]) -> Vec<Candidate>;
 
+    /// Plugins that need no scanning because the format ships them (the mock format). Registered
+    /// in the catalog at startup.
+    fn bundled(&self) -> Vec<PluginDescriptor> {
+        Vec::new()
+    }
+
     /// Whether `probe` must run in a scan worker. VST3 true (it loads the module); AU false.
     fn needs_probe(&self) -> bool;
 

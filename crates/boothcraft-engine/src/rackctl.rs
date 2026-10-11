@@ -44,10 +44,10 @@ pub struct RackControl {
 
 impl RackControl {
     /// Queue a message; returns false if the audio thread has fallen behind and the queue is full.
+    /// Retired racks are not freed here: the caller collects them each frame, either with
+    /// [`RackControl::collect_garbage`] or, when plugins are hosted, [`RackControl::drain_trash`].
     pub fn send(&mut self, msg: RackMsg) -> bool {
-        let ok = self.tx.push(msg).is_ok();
-        self.collect_garbage();
-        ok
+        self.tx.push(msg).is_ok()
     }
 
     /// Drop racks the audio thread has finished with. Only for callers without plugins; a plugin

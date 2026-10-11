@@ -10,7 +10,7 @@
 use crate::cache::ScanCache;
 use crate::catalog::Catalog;
 use crate::crash::Inflight;
-use crate::effect::{PluginEffect, RetiredProcessor, Status, STATUS_BAD_OUTPUT};
+use crate::effect::{specs_from, PluginEffect, RetiredProcessor, Status, STATUS_BAD_OUTPUT};
 use crate::main_thread::MainThread;
 use crate::pending::Pending;
 use crate::scan::{self, ScanConfig, ScanReport};
@@ -21,8 +21,8 @@ use crate::traits::{
 };
 use boothcraft_dsp::rack::{Carried, SLOTS};
 use boothcraft_dsp::{
-    Effect, PluginRef, PluginState, Rack, RackConfig, RackDesc, SlotDesc, SlotError, SlotId,
-    SlotSource, CARRY_NONE,
+    Effect, ParamSpec, PluginRef, PluginState, Rack, RackConfig, RackDesc, SlotDesc, SlotError,
+    SlotId, SlotSource, CARRY_NONE,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -42,6 +42,8 @@ struct Live {
     instance: Option<Box<dyn PluginInstance>>,
     pending: Option<Pending<Box<dyn PluginInstance>>>,
     state_loaded: bool,
+    /// The plugin's parameters as specs, with the format's id for each, built once per load.
+    specs: Option<(Vec<ParamSpec>, Vec<u32>)>,
     active: Option<Active>,
     /// A throwaway instance for Apply: torn down as soon as its processor comes back.
     offline: bool,
@@ -114,6 +116,9 @@ impl PluginManager {
         let cache = dir.as_deref().map(ScanCache::load).unwrap_or_default();
         let mut catalog = Catalog::default();
         catalog.refresh(&cache, &settings.disabled);
+        for d in formats.iter().flat_map(|f| f.bundled()) {
+            catalog.insert(d);
+        }
         let (inflight, unclean) = match dir.as_deref() {
             Some(d) => {
                 let (i, u) = Inflight::start(d);
@@ -199,6 +204,10 @@ impl PluginManager {
         if let Some(d) = &self.dir {
             let _ = self.cache.save(d);
         }
+        self.refresh_catalog();
+    }
+
+    fn refresh_catalog(&mut self) {
         self.catalog.refresh(&self.cache, &self.settings.disabled);
     }
 
@@ -208,7 +217,7 @@ impl PluginManager {
         if let Some(d) = &self.dir {
             let _ = self.settings.save(d);
         }
-        self.catalog.refresh(&self.cache, &self.settings.disabled);
+        self.refresh_catalog();
     }
 
     // ---- events ---------------------------------------------------------------------------
@@ -222,6 +231,9 @@ impl PluginManager {
                 HostEvent::LatencyChanged | HostEvent::ParamsChanged => {
                     if let Some(l) = self.live.get_mut(&slot) {
                         l.restart_pending = true;
+                        if event == HostEvent::ParamsChanged {
+                            l.specs = None;
+                        }
                         self.rebuild_wanted = true;
                     }
                 }
@@ -503,6 +515,7 @@ impl PluginManager {
                     instance: None,
                     pending: Some(pending),
                     state_loaded: false,
+                    specs: None,
                     active: None,
                     offline: self.offline_mode,
                     doomed: self.offline_mode,
@@ -529,14 +542,8 @@ impl PluginManager {
         Ok(())
     }
 
-    fn make_plugin(
-        &mut self,
-        slot: &SlotDesc,
-        cfg: &RackConfig,
-    ) -> Result<Box<dyn Effect>, SlotError> {
-        if self.carry_now.contains(&slot.id) {
-            return Ok(Box::new(Carried));
-        }
+    /// Instantiate the slot's plugin if needed and load its saved state, without activating it.
+    fn load_slot(&mut self, slot: &SlotDesc) -> Result<(), SlotError> {
         let plugin = slot
             .plugin
             .as_ref()
@@ -550,10 +557,8 @@ impl PluginManager {
         self.instance_for(slot, &descriptor)?;
 
         let mt = self.mt;
-        let pcfg = process_config(cfg, self.offline_mode);
         let live = self.live.get_mut(&slot.id).expect("instance_for made it");
         let inst = live.instance.as_mut().expect("instance_for loaded it");
-
         if !live.state_loaded {
             // The saved state is authoritative; `values` only fills in when there is none.
             match &slot.state {
@@ -569,6 +574,46 @@ impl PluginManager {
             }
             live.state_loaded = true;
         }
+        if live.specs.is_none() {
+            live.specs = Some(specs_from(&inst.params()));
+        }
+        Ok(())
+    }
+
+    /// Load a slot's plugin ahead of any rack, so the UI can show and edit its parameters (and
+    /// those edits reach the plugin even with preview off). Cheap once loaded; `NotReady` while an
+    /// asynchronous load is still running.
+    pub fn ensure_loaded(&mut self, slot: &SlotDesc) -> Result<(), SlotError> {
+        let loaded = self
+            .live
+            .get(&slot.id)
+            .is_some_and(|l| l.state_loaded && l.instance.is_some() && l.specs.is_some());
+        if loaded {
+            return Ok(());
+        }
+        self.load_slot(slot)
+    }
+
+    /// The loaded plugin's parameter specs and, for each, the format's parameter id.
+    pub fn specs(&self, slot: SlotId) -> Option<(&[ParamSpec], &[u32])> {
+        let (s, ids) = self.live.get(&slot)?.specs.as_ref()?;
+        Some((s, ids))
+    }
+
+    fn make_plugin(
+        &mut self,
+        slot: &SlotDesc,
+        cfg: &RackConfig,
+    ) -> Result<Box<dyn Effect>, SlotError> {
+        if self.carry_now.contains(&slot.id) {
+            return Ok(Box::new(Carried));
+        }
+        self.load_slot(slot)?;
+
+        let mt = self.mt;
+        let pcfg = process_config(cfg, self.offline_mode);
+        let live = self.live.get_mut(&slot.id).expect("load_slot made it");
+        let inst = live.instance.as_mut().expect("load_slot loaded it");
 
         let mut parked = None;
         if let Some(active) = &mut live.active {

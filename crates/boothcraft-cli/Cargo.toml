@@ -7,9 +7,16 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["plugins"]
+plugins = ["dep:boothcraft-plugin"]
+mock-plugins = ["plugins", "boothcraft-plugin/mock"]
+
 [dependencies]
+boothcraft-plugin = { workspace = true, optional = true }
 boothcraft-core.workspace = true
 boothcraft-io.workspace = true
 boothcraft-dsp.workspace = true
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+serde_json = "1"

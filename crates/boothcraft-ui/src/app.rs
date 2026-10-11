@@ -266,8 +266,23 @@ fn default_dock() -> DockState<Tab> {
 }
 
 impl BoothcraftApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> BoothcraftApp {
+    /// `formats` are the plugin formats this build can host (empty = plugins off). Must be called
+    /// on the main thread, which becomes the thread plugins are driven from.
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        paths: Vec<PathBuf>,
+        formats: Vec<Box<dyn boothcraft_plugin::PluginFormat>>,
+    ) -> BoothcraftApp {
         install_native_fonts(&cc.egui_ctx);
+        let plugins = (!formats.is_empty()).then(|| {
+            let ctx = cc.egui_ctx.clone();
+            boothcraft_plugin::PluginManager::new(
+                boothcraft_plugin::MainThread::init(),
+                formats,
+                boothcraft_plugin::settings::default_dir(),
+                std::sync::Arc::new(move || ctx.request_repaint()),
+            )
+        });
         let cleanup = boothcraft_core::install_cleanup_guard();
         let dock = cc
             .storage
@@ -311,7 +326,7 @@ impl BoothcraftApp {
             paused_at: None,
             recording: None,
             untitled: 0,
-            preview: Preview::new(rack_ctl),
+            preview: Preview::new(rack_ctl, plugins),
             rack_panel: RackPanel::default(),
             effect_dialog: None,
             apply_job: None,
@@ -529,16 +544,34 @@ impl State {
     fn effect_action(&mut self, action: EffectAction) {
         match action {
             EffectAction::TogglePlayback => self.toggle_play(),
-            EffectAction::Apply { label, kind } => {
+            EffectAction::Apply { label, mut kind } => {
                 if self.apply_job.is_some() {
                     return;
                 }
-                if let Some(f) = self.files.get(self.active) {
-                    if let Some(sh) = &self.shared {
-                        sh.pause();
+                let Some(f) = self.files.get(self.active) else {
+                    return;
+                };
+                // A rack with plugins needs new offline instances, which only the main thread can
+                // make; the worker then just renders through them.
+                if let ApplyKind::Rack(desc) = &mut kind {
+                    if desc.has_plugins() {
+                        let channels = ApplyJob::enabled_channels(f).len();
+                        match self
+                            .preview
+                            .prepare_apply(desc, f.doc().sample_rate as f32, channels)
+                        {
+                            Ok(rack) => kind = ApplyKind::Prepared(rack),
+                            Err(why) => {
+                                self.status = format!("Cannot apply {label}: {why}");
+                                return;
+                            }
+                        }
                     }
-                    self.apply_job = Some(ApplyJob::start(self.active, f, label, kind));
                 }
+                if let Some(sh) = &self.shared {
+                    sh.pause();
+                }
+                self.apply_job = Some(ApplyJob::start(self.active, f, label, kind));
             }
         }
     }
@@ -579,6 +612,15 @@ impl State {
             self.preview.set_doc_channels(f.doc().channel_count());
         }
         self.loudness.tick();
+        let keep: std::collections::HashSet<_> = self
+            .rack_panel
+            .desc
+            .slots
+            .iter()
+            .flatten()
+            .map(|s| s.id)
+            .collect();
+        self.preview.sweep_plugins(&keep);
         if self.apply_job.is_none() {
             if let Some((i, label, kind)) = self.apply_queue.pop_front() {
                 if let Some(f) = self.files.get(i) {
@@ -602,6 +644,9 @@ impl State {
         match job.poll() {
             Some(result) => {
                 let job = self.apply_job.take().expect("job present");
+                if let Some(rack) = job.take_rack() {
+                    self.preview.finish_apply(rack);
+                }
                 match (result, self.files.get_mut(job.file)) {
                     (Some(chans), Some(f)) => {
                         job.commit(f, chans);
@@ -2067,6 +2112,11 @@ impl eframe::App for BoothcraftApp {
     /// Persists panel placement and the recent-files list; window position/size are handled by
     /// `eframe` itself. Only takes effect with the "persistence" feature enabled on `eframe`
     /// (it is, for both `boothcraft-app` and `boothcraft-ui`).
+    /// Releases plugins on the main thread, in order, before the audio engine goes away.
+    fn on_exit(&mut self) {
+        self.state.preview.shutdown();
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, DOCK_STORAGE_KEY, &self.dock);
         eframe::set_value(storage, RECENT_FILES_STORAGE_KEY, &self.state.recent_files);

@@ -4,10 +4,13 @@ use crate::ops::OpenFile;
 use crate::param_ui::{effect_editor, envelope_editor};
 use boothcraft_core::{ChannelMask, Rope, Selection};
 use boothcraft_dsp::preset::{self, Preset};
-use boothcraft_dsp::rack::{render_rope, SLOTS};
+use boothcraft_dsp::rack::{render_rope, render_rope_with, OFFLINE_BLOCK, SLOTS};
 use boothcraft_dsp::registry::{self, Category, EFFECTS};
-use boothcraft_dsp::{Envelope, Rack, RackDesc, SlotDesc};
+use boothcraft_dsp::{
+    Envelope, ParamSpec, Rack, RackConfig, RackDesc, SlotDesc, SlotError, SlotId,
+};
 use boothcraft_engine::{RackControl, RackMsg};
+use boothcraft_plugin::PluginManager;
 use egui::{RichText, Ui};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
@@ -29,15 +32,21 @@ pub struct Preview {
     doc_channels: usize,
     /// The rack last installed, to rebuild it if the document's channel count changes.
     installed: Option<RackDesc>,
+    /// Hosted plugins, if enabled. Lives here because every preview rack goes through it.
+    pub plugins: Option<PluginManager>,
+    /// Plugin slots of the installed rack that could not be built, by slot index.
+    pub build_errors: Vec<(usize, SlotError)>,
 }
 
 impl Preview {
-    pub fn new(ctl: Option<RackControl>) -> Preview {
+    pub fn new(ctl: Option<RackControl>, plugins: Option<PluginManager>) -> Preview {
         Preview {
             ctl,
             owner: None,
             doc_channels: 2,
             installed: None,
+            plugins,
+            build_errors: Vec::new(),
         }
     }
 
@@ -70,6 +79,11 @@ impl Preview {
         if self.is_active(owner) {
             self.send(RackMsg::Power(false));
             self.send(RackMsg::Clear);
+            if let Some(m) = &mut self.plugins {
+                m.preview_cleared();
+            }
+            self.build_errors.clear();
+            self.installed = None;
             self.owner = None;
         }
     }
@@ -110,19 +124,160 @@ impl Preview {
         }
     }
 
-    /// Free racks the audio thread has handed back. Call once per frame.
+    /// Take back racks the audio thread has handed back (plugins return to their host rather
+    /// than being dropped), and act on what plugins asked for. Call once per frame.
     pub fn tick(&mut self) {
         if let Some(c) = &mut self.ctl {
-            c.collect_garbage();
+            match &mut self.plugins {
+                Some(m) => {
+                    for rack in c.drain_trash() {
+                        m.retire(rack);
+                    }
+                }
+                None => c.collect_garbage(),
+            }
+        }
+        let rebuild = self.plugins.as_mut().is_some_and(|m| m.pump().rebuild);
+        if rebuild && self.owner.is_some() {
+            if let Some(desc) = self.installed.clone() {
+                self.install(&desc);
+            }
         }
     }
 
     fn install(&mut self, desc: &RackDesc) {
+        let Some(c) = &mut self.ctl else {
+            return;
+        };
+        let channels = self.doc_channels.min(c.channels).max(1);
+        match &mut self.plugins {
+            Some(m) => {
+                let cfg = RackConfig {
+                    sample_rate: c.sample_rate as f32,
+                    channels,
+                    max_block: 1024,
+                };
+                let b = m.build_preview(desc, &cfg);
+                c.send(RackMsg::Rebuild {
+                    rack: b.rack,
+                    carry: b.carry,
+                });
+                self.build_errors = b.errors;
+            }
+            None => {
+                let rack = Rack::new(desc, c.sample_rate as f32, channels, 1024);
+                c.send(RackMsg::Install(Box::new(rack)));
+            }
+        }
+        self.installed = Some(desc.clone());
+    }
+
+    /// Load `slot`'s plugin so its parameters can be shown and edited. `Err` says why not.
+    pub fn ensure_loaded(&mut self, slot: &SlotDesc) -> Result<(), SlotError> {
+        match &mut self.plugins {
+            Some(m) => m.ensure_loaded(slot),
+            None => Err(SlotError::Missing(slot.effect.clone())),
+        }
+    }
+
+    /// The loaded plugin's parameter specs and its current values.
+    pub fn plugin_params(&self, slot: SlotId) -> Option<(Vec<ParamSpec>, Vec<f32>)> {
+        let m = self.plugins.as_ref()?;
+        let (specs, _) = m.specs(slot)?;
+        let values = m.params(slot)?.iter().map(|p| p.current).collect();
+        Some((specs.to_vec(), values))
+    }
+
+    /// A generic-UI edit of a plugin parameter (by index): the plugin's controller hears it now,
+    /// and the audio thread's processor too when this owner's preview is on.
+    pub fn plugin_param(
+        &mut self,
+        owner: Owner,
+        slot_index: usize,
+        slot: SlotId,
+        index: usize,
+        value: f32,
+    ) {
+        if let Some(m) = &mut self.plugins {
+            let id = m.specs(slot).and_then(|(_, ids)| ids.get(index).copied());
+            if let Some(id) = id {
+                m.edit_param(slot, id, value);
+            }
+        }
+        self.param(owner, slot_index, index, value);
+    }
+
+    /// Record every plugin's real state into `desc` (before saving a rack or applying it).
+    pub fn snapshot(&mut self, desc: &mut RackDesc) {
+        if let Some(m) = &mut self.plugins {
+            m.snapshot(desc);
+        }
+    }
+
+    /// Build the Apply rack for a rack with plugins: new offline instances, primed, on this (the
+    /// main) thread. Hand the result to an [`ApplyJob`] and give it back through
+    /// [`Preview::finish_apply`] afterwards. Never skips a slot that failed to build.
+    pub fn prepare_apply(
+        &mut self,
+        desc: &mut RackDesc,
+        sample_rate: f32,
+        channels: usize,
+    ) -> Result<Box<Rack>, String> {
+        let m = self.plugins.as_mut().ok_or("plugins are not enabled")?;
+        m.snapshot(desc);
+        let cfg = RackConfig {
+            sample_rate,
+            channels,
+            max_block: OFFLINE_BLOCK,
+        };
+        match m.prepare_offline(desc, &cfg).poll() {
+            Some(Ok((rack, errors))) if errors.is_empty() => Ok(rack),
+            Some(Ok((rack, errors))) => {
+                m.finish_offline(rack);
+                let why: Vec<String> = errors
+                    .iter()
+                    .map(|(i, e)| format!("slot {}: {e}", i + 1))
+                    .collect();
+                Err(why.join("; "))
+            }
+            Some(Err(e)) => Err(e.to_string()),
+            None => Err("a plugin is still loading; try again in a moment".into()),
+        }
+    }
+
+    /// Tear down an Apply rack on the main thread.
+    pub fn finish_apply(&mut self, rack: Box<Rack>) {
+        if let Some(m) = &mut self.plugins {
+            m.finish_offline(rack);
+        }
+    }
+
+    /// Keep only plugins still wanted by a rack the UI holds; the rest are torn down.
+    pub fn sweep_plugins(&mut self, keep: &std::collections::HashSet<SlotId>) {
+        if let Some(m) = &mut self.plugins {
+            m.sweep(keep);
+        }
+    }
+
+    /// App shutdown: silence the preview rack, collect everything the audio thread returns,
+    /// then release plugins on this thread before the engine goes away.
+    pub fn shutdown(&mut self) {
+        let rack_playing = self.installed.is_some();
+        self.send(RackMsg::Power(false));
+        self.send(RackMsg::Clear);
+        let mut retired = Vec::new();
         if let Some(c) = &mut self.ctl {
-            let channels = self.doc_channels.min(c.channels).max(1);
-            let rack = Rack::new(desc, c.sample_rate as f32, channels, 1024);
-            c.send(RackMsg::Install(Box::new(rack)));
-            self.installed = Some(desc.clone());
+            retired.extend(c.drain_trash());
+            // The audio callback takes the Clear on its next period; wait briefly for the rack
+            // it was playing (about 500 ms at most, and not at all if none was).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while rack_playing && retired.is_empty() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                retired.extend(c.drain_trash());
+            }
+        }
+        if let Some(m) = &mut self.plugins {
+            m.shutdown(retired);
         }
     }
 
@@ -150,6 +305,9 @@ pub fn effects_by_category(
 /// What applying an effect means.
 pub enum ApplyKind {
     Rack(RackDesc),
+    /// A rack already built on the main thread (it holds plugins). Comes back through
+    /// [`ApplyJob::take_rack`] to be torn down there.
+    Prepared(Box<Rack>),
     Offline {
         id: &'static str,
         values: Vec<f32>,
@@ -181,7 +339,15 @@ pub struct ApplyJob {
     channels: Vec<usize>,
     progress: Arc<AtomicU32>,
     cancel: Arc<AtomicBool>,
-    rx: mpsc::Receiver<Option<ApplyResult>>,
+    rx: mpsc::Receiver<ApplyMsg>,
+    /// The prepared rack, once the worker returns it.
+    returned_rack: std::cell::RefCell<Option<Box<Rack>>>,
+}
+
+/// What the worker sends back: the audio (`None` = cancelled or failed) and any prepared rack.
+struct ApplyMsg {
+    result: Option<ApplyResult>,
+    rack: Option<Box<Rack>>,
 }
 
 impl ApplyJob {
@@ -193,10 +359,15 @@ impl ApplyJob {
         } else {
             file.selection.range()
         };
-        let channels: Vec<usize> = (0..doc.channel_count())
-            .filter(|c| file.mask.has(*c))
-            .collect();
+        let channels = Self::enabled_channels(file);
         Self::spawn(file_index, file, label, kind, range, channels)
+    }
+
+    /// The channels an Apply on this file renders: those enabled for editing.
+    pub fn enabled_channels(file: &OpenFile) -> Vec<usize> {
+        (0..file.doc().channel_count())
+            .filter(|c| file.mask.has(*c))
+            .collect()
     }
 
     /// Render the whole file on every channel (Match Loudness).
@@ -237,16 +408,28 @@ impl ApplyJob {
         // Cloning a rope is cheap (it shares blocks structurally; O(blocks), not O(samples)).
         // The other kinds need their whole range as flat buffers anyway for their own analysis
         // (a peak scan, an LUFS pass, …), so they keep materializing it up front.
-        if let ApplyKind::Rack(desc) = kind {
+        if matches!(kind, ApplyKind::Rack(_) | ApplyKind::Prepared(_)) {
             let ropes: Vec<Rope> = channels
                 .iter()
                 .map(|&ch| doc.channels[ch].clone())
                 .collect();
             let render_range = range.clone();
             std::thread::spawn(move || {
-                let result =
-                    render_rope(&desc, &ropes, render_range, rate, &p, &c).map(ApplyResult::Ropes);
-                let _ = tx.send(result);
+                let msg = match kind {
+                    ApplyKind::Rack(desc) => ApplyMsg {
+                        result: render_rope(&desc, &ropes, render_range, rate, &p, &c)
+                            .map(ApplyResult::Ropes),
+                        rack: None,
+                    },
+                    ApplyKind::Prepared(mut rack) => ApplyMsg {
+                        result: render_rope_with(&mut rack, &ropes, render_range, &p, &c)
+                            .map(ApplyResult::Ropes),
+                        // The plugins inside must be torn down on the main thread.
+                        rack: Some(rack),
+                    },
+                    _ => unreachable!("checked above"),
+                };
+                let _ = tx.send(msg);
             });
             return ApplyJob {
                 file: file_index,
@@ -256,6 +439,7 @@ impl ApplyJob {
                 progress,
                 cancel,
                 rx,
+                returned_rack: Default::default(),
             };
         }
 
@@ -265,7 +449,7 @@ impl ApplyJob {
             .collect();
         std::thread::spawn(move || {
             let ok = match kind {
-                ApplyKind::Rack(_) => unreachable!("handled above"),
+                ApplyKind::Rack(_) | ApplyKind::Prepared(_) => unreachable!("handled above"),
                 ApplyKind::MatchLoudness { target, ceiling } => {
                     let applied = boothcraft_dsp::loudness::match_loudness(
                         &mut chans,
@@ -296,7 +480,10 @@ impl ApplyJob {
                     None => false,
                 },
             };
-            let _ = tx.send(ok.then_some(ApplyResult::Flat(chans)));
+            let _ = tx.send(ApplyMsg {
+                result: ok.then_some(ApplyResult::Flat(chans)),
+                rack: None,
+            });
         });
         ApplyJob {
             file: file_index,
@@ -306,6 +493,7 @@ impl ApplyJob {
             progress,
             cancel,
             rx,
+            returned_rack: Default::default(),
         }
     }
 
@@ -320,10 +508,19 @@ impl ApplyJob {
     /// `Some(result)` once the worker has finished (`None` inside means cancelled or failed).
     pub fn poll(&self) -> Option<Option<ApplyResult>> {
         match self.rx.try_recv() {
-            Ok(r) => Some(r),
+            Ok(msg) => {
+                *self.returned_rack.borrow_mut() = msg.rack;
+                Some(msg.result)
+            }
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => Some(None),
         }
+    }
+
+    /// The prepared rack, once `poll` has reported the job finished, for the main thread to
+    /// hand to [`Preview::finish_apply`].
+    pub fn take_rack(&self) -> Option<Box<Rack>> {
+        self.returned_rack.borrow_mut().take()
     }
 
     /// Write the rendered audio back as one undoable step.
@@ -415,6 +612,7 @@ impl RackPanel {
                         .set_file_name("rack.json")
                         .save_file()
                     {
+                        preview.snapshot(&mut self.desc);
                         let _ = preset::save_rack(&path, &self.desc);
                     }
                     ui.close();
@@ -450,7 +648,9 @@ impl RackPanel {
                         match &mut self.desc.slots[i] {
                             Some(slot) => {
                                 let name = registry::info(&slot.effect)
-                                    .map_or(slot.effect.as_str(), |e| e.name);
+                                    .map(|e| e.name)
+                                    .or(slot.plugin.as_ref().map(|p| p.name.as_str()))
+                                    .unwrap_or(slot.effect.as_str());
                                 let mut bypassed = slot.bypass;
                                 if ui
                                     .checkbox(&mut bypassed, "")
@@ -470,6 +670,12 @@ impl RackPanel {
                                     .clicked()
                                 {
                                     self.selected = Some(i);
+                                }
+                                if slot.plugin.is_some() {
+                                    if let Some((badge, why)) = plugin_badge(preview, i, slot) {
+                                        ui.label(RichText::new(badge).small().weak())
+                                            .on_hover_text(why);
+                                    }
                                 }
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -507,6 +713,26 @@ impl RackPanel {
                             }
                             None => {
                                 ui.menu_button(RichText::new("+ Add effect").weak(), |ui| {
+                                    if let Some(m) = &preview.plugins {
+                                        if !m.catalog().is_empty() {
+                                            ui.menu_button("Plugins", |ui| {
+                                                for (vendor, list) in m.catalog().by_vendor() {
+                                                    ui.menu_button(vendor, |ui| {
+                                                        for d in list {
+                                                            if ui.button(&d.name).clicked() {
+                                                                self.desc.slots[i] =
+                                                                    Some(m.new_slot(d));
+                                                                self.selected = Some(i);
+                                                                structural = true;
+                                                                ui.close();
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                            });
+                                            ui.separator();
+                                        }
+                                    }
                                     for (cat, list) in effects_by_category(true) {
                                         ui.menu_button(cat.name(), |ui| {
                                             for e in list {
@@ -528,7 +754,9 @@ impl RackPanel {
         ui.separator();
         if let Some(i) = self.selected {
             if let Some(slot) = &mut self.desc.slots[i] {
-                if let (Some(info), Some(specs)) =
+                if slot.plugin.is_some() {
+                    plugin_editor(ui, preview, i, slot);
+                } else if let (Some(info), Some(specs)) =
                     (registry::info(&slot.effect), registry::specs(&slot.effect))
                 {
                     ui.label(RichText::new(info.name).strong());
@@ -603,6 +831,61 @@ impl RackPanel {
         }
         action
     }
+}
+
+/// A short status for a plugin slot that is not (yet) usable, with the reason for the tooltip.
+fn plugin_badge(
+    preview: &mut Preview,
+    index: usize,
+    slot: &SlotDesc,
+) -> Option<(&'static str, String)> {
+    let err = match preview.ensure_loaded(slot) {
+        Ok(()) => preview
+            .build_errors
+            .iter()
+            .find(|(i, _)| *i == index)
+            .map(|(_, e)| e.clone())?,
+        Err(e) => e,
+    };
+    let badge = match &err {
+        SlotError::Missing(_) => "missing",
+        SlotError::NotReady => "loading…",
+        SlotError::UnsupportedRate(_) => "unsupported rate",
+        _ => "failed",
+    };
+    Some((badge, err.to_string()))
+}
+
+/// The generic parameter editor for a plugin slot: parameters come from the plugin itself.
+fn plugin_editor(ui: &mut Ui, preview: &mut Preview, index: usize, slot: &mut SlotDesc) {
+    let name = slot
+        .plugin
+        .as_ref()
+        .map_or("Plugin", |p| p.name.as_str())
+        .to_string();
+    ui.label(RichText::new(name).strong());
+    if let Err(e) = preview.ensure_loaded(slot) {
+        ui.label(RichText::new(e.to_string()).weak());
+        ui.separator();
+        return;
+    }
+    let Some((specs, current)) = preview.plugin_params(slot.id) else {
+        return;
+    };
+    if slot.values.len() != specs.len() {
+        slot.values = current;
+    }
+    let slot_id = slot.id;
+    for (k, v) in effect_editor(
+        ui,
+        ("rack_params", index),
+        &slot.effect,
+        &specs,
+        &mut slot.values,
+    ) {
+        preview.plugin_param(Owner::Rack, index, slot_id, k, v);
+    }
+    ui.separator();
 }
 
 /// A single effect opened from the Effects menu.
