@@ -152,6 +152,10 @@ pub trait PluginFormat: Send + Sync {
         Vec::new()
     }
 
+    /// Called once in a scan worker process before it probes anything (e.g. to keep it out of the
+    /// Dock on macOS).
+    fn init_scan_worker(&self) {}
+
     /// Whether `probe` must run in a scan worker. VST3 true (it loads the module); AU false.
     fn needs_probe(&self) -> bool;
 

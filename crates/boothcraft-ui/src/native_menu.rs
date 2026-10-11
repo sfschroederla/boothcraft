@@ -67,6 +67,8 @@ pub enum Action {
     SetColorMap(ColorMap),
     SetFreqAxis(FreqAxis),
     ResetLayout,
+    /// Open the Plugin Manager window.
+    PluginManager,
     Invert,
     Reverse,
     Silence,
@@ -394,6 +396,8 @@ pub fn install() -> NativeMenu {
         .expect("static menu construction");
     let reset_layout = MenuItem::new("Reset Panel Layout", true, None);
     register(&reset_layout, Action::ResetLayout);
+    let plugin_manager = MenuItem::new("Plugin Manager…", true, None);
+    register(&plugin_manager, Action::PluginManager);
     view_menu
         .append_items(
             &view_modes
@@ -403,6 +407,7 @@ pub fn install() -> NativeMenu {
                 .chain([
                     &PredefinedMenuItem::separator() as &dyn muda::IsMenuItem,
                     &reset_layout,
+                    &plugin_manager,
                 ])
                 .collect::<Vec<_>>(),
         )

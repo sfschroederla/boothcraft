@@ -142,3 +142,69 @@ fn unchanged_files_are_not_probed_again_and_blocks_clear_on_change() {
         .any(|e| matches!(e.outcome, Outcome::Ok(_))));
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[test]
+fn manager_scans_in_the_background_and_manages_the_results() {
+    use boothcraft_plugin::{MainThread, PluginManager};
+    let dir = temp("manager");
+    touch(&dir, "gain.mock");
+    touch(&dir, "delay64.mock");
+    let crash = touch(&dir, "crash.mock");
+
+    let mut m = PluginManager::new(
+        MainThread::init(),
+        formats(),
+        None,
+        std::sync::Arc::new(|| {}),
+    );
+    let bundled = m.catalog().len(); // the mock format ships a few plugins of its own
+    m.settings.extra_paths = vec![dir.clone()];
+    assert!(
+        !m.settings.scan_standard_locations,
+        "standard folders are off by default"
+    );
+
+    m.start_scan(config(10_000, 10_000));
+    assert!(m.is_scanning());
+    let report = loop {
+        if let Some(r) = m.pump().scan_finished {
+            break r;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!m.is_scanning());
+    assert_eq!(m.scan_progress(), (3, 3), "every file was counted");
+    assert_eq!(report.found, 2);
+    assert_eq!(report.blocked, vec![crash.clone()]);
+
+    // Scanned plugins join the catalog (the mock's own bundled ones share uids with these).
+    assert!(m.catalog().len() >= bundled);
+    let id = m
+        .catalog()
+        .all()
+        .find(|d| d.uid == "delay:64")
+        .unwrap()
+        .effect_id();
+
+    // Switching one off removes it from menus but keeps it listed for switching back on.
+    m.set_enabled(&id, false);
+    assert!(m.catalog().get(&id).is_none());
+    assert!(m.catalog().known().any(|d| d.effect_id() == id));
+    m.set_enabled(&id, true);
+    assert!(m.catalog().get(&id).is_some());
+
+    // The blocked file is reported, and unblocking lets the next scan try it again.
+    assert_eq!(m.blocked().len(), 1);
+    m.unblock(&crash);
+    assert!(m.blocked().is_empty());
+    m.start_scan(config(10_000, 10_000));
+    while m.pump().scan_finished.is_none() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        m.scan_progress(),
+        (1, 1),
+        "only the unblocked file was probed again"
+    );
+    std::fs::remove_dir_all(dir).ok();
+}

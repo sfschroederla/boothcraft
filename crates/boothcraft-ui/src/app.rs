@@ -9,6 +9,7 @@ use crate::meters::Meters;
 use crate::ops::OpenFile;
 #[cfg(not(target_os = "macos"))]
 use crate::ops::ZeroAdjust;
+use crate::plugin_manager_ui::PluginManagerPanel;
 use crate::scale;
 use crate::selview_panel::SelViewPanel;
 use crate::spectral::ViewMode;
@@ -135,6 +136,7 @@ struct State {
     untitled: usize,
     preview: Preview,
     rack_panel: RackPanel,
+    plugin_manager: PluginManagerPanel,
     effect_dialog: Option<EffectDialog>,
     apply_job: Option<ApplyJob>,
     generator: Option<Generator>,
@@ -300,6 +302,7 @@ impl BoothcraftApp {
             }
             Err(e) => (None, format!("No audio output ({e}); editing still works")),
         };
+        let plugins_crashed = plugins.as_ref().is_some_and(|m| !m.unclean.is_empty());
         // Say how many plugins are known, so it is obvious from the first frame that plugin
         // hosting is built in and whether a scan has been done.
         let status = match &plugins {
@@ -334,6 +337,8 @@ impl BoothcraftApp {
             untitled: 0,
             preview: Preview::new(rack_ctl, plugins),
             rack_panel: RackPanel::default(),
+            // Open straight away if the last session ended in a crash with plugins loaded.
+            plugin_manager: PluginManagerPanel::new(plugins_crashed),
             effect_dialog: None,
             apply_job: None,
             generator: None,
@@ -550,6 +555,7 @@ impl State {
     fn effect_action(&mut self, action: EffectAction) {
         match action {
             EffectAction::TogglePlayback => self.toggle_play(),
+            EffectAction::OpenPluginManager => self.plugin_manager.open = true,
             EffectAction::Apply { label, mut kind } => {
                 if self.apply_job.is_some() {
                     return;
@@ -633,6 +639,10 @@ impl State {
                     self.apply_job = Some(ApplyJob::start_whole(i, f, label, kind));
                 }
             }
+        }
+        if let Some(m) = self.preview.plugins.as_mut() {
+            self.plugin_manager
+                .show(ctx, m, self.preview.last_scan.as_ref());
         }
         let playing = self.shared.as_ref().is_some_and(|s| s.is_playing());
         if let Some(dlg) = &mut self.effect_dialog {
@@ -1081,6 +1091,7 @@ impl State {
             Action::SetColorMap(m) => self.display.spectral.color_map = m,
             Action::SetFreqAxis(a) => self.display.spectral.freq_axis = a,
             Action::ResetLayout => *dock = default_dock(),
+            Action::PluginManager => self.plugin_manager.open = true,
             Action::Invert => {
                 if self.active < self.files.len() {
                     self.files[self.active].invert();
@@ -1341,6 +1352,10 @@ impl State {
                 ui.separator();
                 if ui.button("Reset Panel Layout").clicked() {
                     *dock = default_dock();
+                    ui.close();
+                }
+                if self.preview.plugins.is_some() && ui.button("Plugin Manager…").clicked() {
+                    self.plugin_manager.open = true;
                     ui.close();
                 }
             });

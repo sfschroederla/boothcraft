@@ -6,6 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
+    /// Every plugin found, enabled or not (for the Plugin Manager's list).
+    known: BTreeMap<String, PluginDescriptor>,
+    /// The enabled ones: what menus and racks offer.
     by_id: BTreeMap<String, PluginDescriptor>,
     /// Plugins added directly (bundled with a format, or registered by tests), which a refresh
     /// from the scan cache must not drop.
@@ -17,14 +20,19 @@ pub struct Catalog {
 impl Catalog {
     /// Rebuild from the cache and the pinned plugins, leaving out disabled ones.
     pub fn refresh(&mut self, cache: &ScanCache, disabled: &BTreeSet<String>) {
-        let by_id: BTreeMap<_, _> = cache
+        let known: BTreeMap<_, _> = cache
             .descriptors()
             .map(|d| (d.effect_id(), d.clone()))
             .chain(self.pinned.clone())
-            .filter(|(id, _)| !disabled.contains(id))
             .collect();
-        if by_id != self.by_id {
+        let by_id: BTreeMap<_, _> = known
+            .iter()
+            .filter(|(id, _)| !disabled.contains(*id))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if by_id != self.by_id || known != self.known {
             self.by_id = by_id;
+            self.known = known;
             self.generation += 1;
         }
     }
@@ -32,12 +40,18 @@ impl Catalog {
     /// Add a plugin that no scan provides; it stays through refreshes.
     pub fn insert(&mut self, d: PluginDescriptor) {
         self.pinned.insert(d.effect_id(), d.clone());
+        self.known.insert(d.effect_id(), d.clone());
         self.by_id.insert(d.effect_id(), d);
         self.generation += 1;
     }
 
     pub fn get(&self, effect_id: &str) -> Option<&PluginDescriptor> {
         self.by_id.get(effect_id)
+    }
+
+    /// Every plugin found, including disabled ones.
+    pub fn known(&self) -> impl Iterator<Item = &PluginDescriptor> {
+        self.known.values()
     }
 
     pub fn all(&self) -> impl Iterator<Item = &PluginDescriptor> {

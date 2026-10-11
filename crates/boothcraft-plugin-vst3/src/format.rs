@@ -57,6 +57,30 @@ fn find_bundles(root: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Make this process a background ("UI element") application: no Dock icon, no menu bar.
+#[cfg(target_os = "macos")]
+fn hide_from_dock() {
+    #[repr(C)]
+    struct ProcessSerialNumber {
+        high: u32,
+        low: u32,
+    }
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn TransformProcessType(psn: *const ProcessSerialNumber, kind: u32) -> i32;
+    }
+    const K_CURRENT_PROCESS: u32 = 2;
+    const TO_UI_ELEMENT_APPLICATION: u32 = 4;
+    let psn = ProcessSerialNumber {
+        high: 0,
+        low: K_CURRENT_PROCESS,
+    };
+    // SAFETY: plain C call with a valid, live pointer; a failure just leaves the Dock icon.
+    unsafe {
+        TransformProcessType(&psn, TO_UI_ELEMENT_APPLICATION);
+    }
+}
+
 impl PluginFormat for Vst3Format {
     fn kind(&self) -> &'static str {
         "vst3"
@@ -78,6 +102,13 @@ impl PluginFormat for Vst3Format {
             .into_iter()
             .map(|path| Candidate { path, known: None })
             .collect()
+    }
+
+    fn init_scan_worker(&self) {
+        // The worker is a copy of the app's executable; without this each one would bounce a
+        // Dock icon while it probes a plugin.
+        #[cfg(target_os = "macos")]
+        hide_from_dock();
     }
 
     fn needs_probe(&self) -> bool {

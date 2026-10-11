@@ -14,6 +14,8 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -49,6 +51,21 @@ impl WorkerCommand {
     }
 }
 
+/// How far a scan has got, readable from the UI while it runs.
+#[derive(Debug, Default)]
+pub struct ScanProgress {
+    /// Plugin files that need probing in this scan.
+    pub total: AtomicUsize,
+    /// Of those, how many have finished.
+    pub done: AtomicUsize,
+}
+
+impl ScanProgress {
+    pub fn get(&self) -> (usize, usize) {
+        (self.done.load(Relaxed), self.total.load(Relaxed))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ScanConfig {
     pub worker: WorkerCommand,
@@ -58,6 +75,7 @@ pub struct ScanConfig {
     /// Also search each format's standard install locations (the default). Off, only the extra
     /// folders given are searched.
     pub standard_locations: bool,
+    pub progress: Arc<ScanProgress>,
 }
 
 impl ScanConfig {
@@ -68,6 +86,7 @@ impl ScanConfig {
             retry_timeout: Duration::from_secs(120),
             parallel: 4,
             standard_locations: true,
+            progress: Arc::new(ScanProgress::default()),
         }
     }
 }
@@ -101,6 +120,7 @@ pub fn maybe_run_scan_worker(formats: &[Box<dyn PluginFormat>]) {
             let kind = kind.to_string_lossy();
             match formats.iter().find(|f| f.kind() == kind) {
                 Some(f) => {
+                    f.init_scan_worker();
                     let cand = Candidate {
                         path: PathBuf::from(path),
                         known: None,
@@ -178,6 +198,7 @@ fn run_pool(
     jobs: Vec<(usize, PathBuf)>,
     parallel: usize,
     timeout: Duration,
+    count_progress: bool,
 ) -> Vec<(usize, Probe)> {
     let mut queue: VecDeque<_> = jobs.into();
     let mut running: Vec<Running> = Vec::new();
@@ -189,7 +210,12 @@ fn run_pool(
             };
             match start(cfg, format, index, &path) {
                 Ok(r) => running.push(r),
-                Err(p) => results.push((index, p)),
+                Err(p) => {
+                    results.push((index, p));
+                    if count_progress {
+                        cfg.progress.done.fetch_add(1, Relaxed);
+                    }
+                }
             }
         }
         let mut i = 0;
@@ -199,6 +225,9 @@ fn run_pool(
                     let run = running.swap_remove(i);
                     let index = run.index;
                     results.push((index, finish(run, status)));
+                    if count_progress {
+                        cfg.progress.done.fetch_add(1, Relaxed);
+                    }
                 }
                 Ok(None) if running[i].started.elapsed() > timeout => {
                     let mut run = running.swap_remove(i);
@@ -206,11 +235,15 @@ fn run_pool(
                     let _ = run.child.wait();
                     let _ = run.reader.join();
                     results.push((run.index, Probe::TimedOut));
+                    // A timeout is retried, so it only counts once that retry has finished.
                 }
                 Ok(None) => i += 1,
                 Err(e) => {
                     let run = running.swap_remove(i);
                     results.push((run.index, Probe::Crashed(format!("wait failed: {e}"))));
+                    if count_progress {
+                        cfg.progress.done.fetch_add(1, Relaxed);
+                    }
                 }
             }
         }
@@ -228,6 +261,8 @@ pub fn scan(
     extra: &[PathBuf],
     cfg: &ScanConfig,
 ) -> ScanReport {
+    cfg.progress.total.store(0, Relaxed);
+    cfg.progress.done.store(0, Relaxed);
     let mut report = ScanReport::default();
     for format in formats {
         let kind = format.kind();
@@ -259,7 +294,8 @@ pub fn scan(
             .map(|(i, c)| (i, c.path.clone()))
             .collect();
         report.probed += jobs.len();
-        let mut results = run_pool(cfg, kind, jobs, cfg.parallel, cfg.timeout);
+        cfg.progress.total.fetch_add(jobs.len(), Relaxed);
+        let mut results = run_pool(cfg, kind, jobs, cfg.parallel, cfg.timeout, true);
 
         // Timeouts may just mean a busy machine: retry them one at a time, with longer to finish.
         let retry: Vec<(usize, PathBuf)> = results
@@ -269,7 +305,9 @@ pub fn scan(
             .collect();
         if !retry.is_empty() {
             results.retain(|(_, p)| !matches!(p, Probe::TimedOut));
-            results.extend(run_pool(cfg, kind, retry, 1, cfg.retry_timeout));
+            let retried = run_pool(cfg, kind, retry, 1, cfg.retry_timeout, false);
+            cfg.progress.done.fetch_add(retried.len(), Relaxed);
+            results.extend(retried);
         }
 
         for (i, probe) in results {

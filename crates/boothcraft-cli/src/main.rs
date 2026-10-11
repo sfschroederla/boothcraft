@@ -81,8 +81,12 @@ enum PluginsCommand {
         /// An extra folder to search, for this run (repeatable).
         #[arg(long = "path")]
         paths: Vec<PathBuf>,
-        /// Search only the `--path` folders, not the standard plugin folders.
-        #[arg(long, requires = "paths")]
+        /// Also search the standard system plugin folders (all of your installed plugins). Off
+        /// unless this is given or the app's Plugin Manager has it ticked.
+        #[arg(long)]
+        standard: bool,
+        /// Accepted for compatibility: searching only `--path` folders is now the default.
+        #[arg(long, hide = true)]
         only_given_paths: bool,
     },
     /// List the plugins found by the last scan.
@@ -118,11 +122,12 @@ fn plugins_command(action: PluginsCommand) -> Result<()> {
     match action {
         PluginsCommand::Scan {
             paths,
-            only_given_paths,
+            standard,
+            only_given_paths: _,
         } => {
             manager.settings.extra_paths.extend(paths);
             let mut cfg = ScanConfig::new(WorkerCommand::current_exe()?);
-            cfg.standard_locations = !only_given_paths;
+            cfg.standard_locations = standard || manager.settings.scan_standard_locations;
             let r = manager.scan_blocking(&cfg);
             println!(
                 "probed {}, cached {}, found {} plugin(s)",

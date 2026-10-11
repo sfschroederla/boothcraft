@@ -13,7 +13,7 @@ use crate::crash::Inflight;
 use crate::effect::{specs_from, PluginEffect, RetiredProcessor, Status, STATUS_BAD_OUTPUT};
 use crate::main_thread::MainThread;
 use crate::pending::Pending;
-use crate::scan::{self, ScanConfig, ScanReport};
+use crate::scan::{self, ScanConfig, ScanReport, WorkerCommand};
 use crate::settings::PluginSettings;
 use crate::traits::{
     Activated, AudioIo, HostContext, HostEvent, ParamInfo, ParamQueue, PluginDescriptor,
@@ -99,6 +99,7 @@ pub struct PluginManager {
     pub unclean: Vec<PluginRef>,
     rebuild_wanted: bool,
     scan_job: Option<Pending<(ScanCache, ScanReport)>>,
+    progress: Option<std::sync::Arc<crate::scan::ScanProgress>>,
     /// Instances deliberately leaked at shutdown because their processor never came back.
     pub leaked: usize,
 }
@@ -145,6 +146,7 @@ impl PluginManager {
             unclean,
             rebuild_wanted: false,
             scan_job: None,
+            progress: Some(Default::default()),
             leaked: 0,
         }
     }
@@ -173,6 +175,8 @@ impl PluginManager {
         if self.scan_job.is_some() {
             return;
         }
+        // Whatever progress object this scan was built with is the one to report.
+        self.progress = Some(cfg.progress.clone());
         let (tx, pending) = Pending::channel();
         let formats = self.formats.clone();
         let mut cache = self.cache.clone();
@@ -186,6 +190,56 @@ impl PluginManager {
 
     pub fn is_scanning(&self) -> bool {
         self.scan_job.is_some()
+    }
+
+    /// A scan of the folders in the settings, run by this same executable in worker mode.
+    /// Standard system folders are searched only if the settings say so.
+    pub fn scan_config(&self) -> std::io::Result<ScanConfig> {
+        let mut cfg = ScanConfig::new(WorkerCommand::current_exe()?);
+        cfg.standard_locations = self.settings.scan_standard_locations;
+        if let Some(p) = &self.progress {
+            cfg.progress = p.clone();
+        }
+        Ok(cfg)
+    }
+
+    /// (finished, total) of the scan in progress, or of the last one.
+    pub fn scan_progress(&self) -> (usize, usize) {
+        self.progress.as_ref().map_or((0, 0), |p| p.get())
+    }
+
+    pub fn save_settings(&self) {
+        if let Some(d) = &self.dir {
+            let _ = self.settings.save(d);
+        }
+    }
+
+    /// Turn one plugin on or off everywhere (menus, racks), and remember it.
+    pub fn set_enabled(&mut self, effect_id: &str, enabled: bool) {
+        if enabled {
+            self.settings.disabled.remove(effect_id);
+        } else {
+            self.settings.disabled.insert(effect_id.to_string());
+        }
+        self.save_settings();
+        self.refresh_catalog();
+    }
+
+    /// Plugin files that crashed or hung while scanning, with why.
+    pub fn blocked(&self) -> Vec<(PathBuf, crate::cache::BlockReason)> {
+        self.cache
+            .blocked()
+            .into_iter()
+            .map(|(p, r)| (p, r.clone()))
+            .collect()
+    }
+
+    /// Lift a block so the next scan probes the file again.
+    pub fn unblock(&mut self, path: &std::path::Path) {
+        self.cache.unblock(path);
+        if let Some(d) = &self.dir {
+            let _ = self.cache.save(d);
+        }
     }
 
     /// Scan and wait (the CLI).

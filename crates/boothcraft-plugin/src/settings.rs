@@ -19,8 +19,11 @@ pub fn default_dir() -> Option<PathBuf> {
 pub struct PluginSettings {
     /// Whether plugins are loaded at all (the Preferences opt-in).
     pub enabled: bool,
-    /// Folders searched in addition to each format's standard locations.
+    /// Folders to search for plugins.
     pub extra_paths: Vec<PathBuf>,
+    /// Also search each format's standard install folders. Off by default: with hundreds of
+    /// plugins installed, scanning them all should be a choice.
+    pub scan_standard_locations: bool,
     /// Effect ids (`vst3:…`) the user or the crash prompt turned off.
     pub disabled: BTreeSet<String>,
 }

@@ -36,6 +36,8 @@ pub struct Preview {
     pub plugins: Option<PluginManager>,
     /// Plugin slots of the installed rack that could not be built, by slot index.
     pub build_errors: Vec<(usize, SlotError)>,
+    /// The result of the most recent plugin scan, for the Plugin Manager to report.
+    pub last_scan: Option<boothcraft_plugin::ScanReport>,
 }
 
 impl Preview {
@@ -47,6 +49,7 @@ impl Preview {
             installed: None,
             plugins,
             build_errors: Vec::new(),
+            last_scan: None,
         }
     }
 
@@ -137,7 +140,14 @@ impl Preview {
                 None => c.collect_garbage(),
             }
         }
-        let rebuild = self.plugins.as_mut().is_some_and(|m| m.pump().rebuild);
+        let mut rebuild = false;
+        if let Some(m) = &mut self.plugins {
+            let p = m.pump();
+            rebuild = p.rebuild;
+            if p.scan_finished.is_some() {
+                self.last_scan = p.scan_finished;
+            }
+        }
         if rebuild && self.owner.is_some() {
             if let Some(desc) = self.installed.clone() {
                 self.install(&desc);
@@ -565,6 +575,8 @@ pub enum EffectAction {
     },
     /// Start or stop playback for preview.
     TogglePlayback,
+    /// Show the Plugin Manager window (to scan for plugins).
+    OpenPluginManager,
 }
 
 /// The Effects Rack panel.
@@ -604,6 +616,14 @@ impl RackPanel {
                 } else {
                     preview.stop(Owner::Rack);
                 }
+            }
+            if preview.plugins.is_some()
+                && ui
+                    .button("Plugins…")
+                    .on_hover_text("Plugin Manager: scan for plugins and manage them")
+                    .clicked()
+            {
+                action = Some(EffectAction::OpenPluginManager);
             }
             ui.menu_button("Rack Presets", |ui| {
                 if ui.button("Save Rack…").clicked() {
@@ -715,14 +735,16 @@ impl RackPanel {
                                 ui.menu_button(RichText::new("+ Add effect").weak(), |ui| {
                                     if let Some(m) = &preview.plugins {
                                         if m.catalog().is_empty() {
-                                            ui.add_enabled(
-                                                false,
-                                                egui::Button::new("Plugins: none scanned yet"),
-                                            )
-                                            .on_disabled_hover_text(
-                                                "Run `boothcraft-cli plugins scan --path <folder> \
-                                                 --only-given-paths`, then restart the app",
-                                            );
+                                            if ui
+                                                .button("Plugins: scan for plugins…")
+                                                .on_hover_text(
+                                                    "No plugins known yet. Opens the Plugin Manager.",
+                                                )
+                                                .clicked()
+                                            {
+                                                action = Some(EffectAction::OpenPluginManager);
+                                                ui.close();
+                                            }
                                             ui.separator();
                                         } else {
                                             ui.menu_button("Plugins", |ui| {
