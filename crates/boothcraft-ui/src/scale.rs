@@ -19,6 +19,16 @@ impl AmpUnits {
         AmpUnits::Sample16,
     ];
 
+    /// Short name shown above the scale.
+    pub fn short(self) -> &'static str {
+        match self {
+            AmpUnits::Db => "dB",
+            AmpUnits::Percent => "%",
+            AmpUnits::Normalized => "norm",
+            AmpUnits::Sample16 => "smp",
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             AmpUnits::Db => "dB",
@@ -45,6 +55,16 @@ impl TimeFormat {
         TimeFormat::Samples,
         TimeFormat::Smpte,
     ];
+
+    /// Short name shown in the ruler's corner.
+    pub fn short(self) -> &'static str {
+        match self {
+            TimeFormat::Time => "hms",
+            TimeFormat::Decimal => "sec",
+            TimeFormat::Samples => "samples",
+            TimeFormat::Smpte => "smpte",
+        }
+    }
 
     pub fn name(self) -> &'static str {
         match self {
@@ -107,6 +127,17 @@ pub fn amp_gridlines(units: AmpUnits, zoom: f32, half_px: f32, min_gap_px: f32) 
         }
     }
     out
+}
+
+/// Fine levels near full scale get a decimal (`-0.5`), the rest are whole numbers.
+fn db_label(db: f32) -> String {
+    if db == 0.0 {
+        "0".into()
+    } else if db > -3.0 {
+        format!("{db:.1}")
+    } else {
+        format!("{db:.0}")
+    }
 }
 
 fn linear_label(units: AmpUnits, v: f32) -> String {
@@ -261,6 +292,16 @@ fn fraction_digits(step_secs: f64) -> usize {
     }
 }
 
+/// Full-precision readout of a position, for the timecode display and panels.
+pub fn format_position(frame: f64, rate: u32, fmt: TimeFormat) -> String {
+    match fmt {
+        TimeFormat::Time => format_time(frame, rate),
+        TimeFormat::Decimal => format!("{:.3}", frame / rate as f64),
+        TimeFormat::Samples => format!("{}", frame.round().max(0.0) as u64),
+        TimeFormat::Smpte => format_smpte(frame, rate),
+    }
+}
+
 pub fn format_smpte(frame: f64, rate: u32) -> String {
     let total_frames = (frame / rate as f64 * SMPTE_FPS).round().max(0.0) as u64;
     let fps = SMPTE_FPS as u64;
@@ -305,6 +346,21 @@ mod tests {
             "everything shown fits the lane"
         );
         assert!(g8.first().unwrap().value < g1.first().unwrap().value);
+    }
+
+    #[test]
+    fn db_labels_use_decimals_only_near_full_scale() {
+        let g = amp_gridlines(AmpUnits::Db, 1.0, 500.0, 18.0);
+        let labels: Vec<&str> = g.iter().map(|l| l.label.as_str()).collect();
+        assert!(labels.contains(&"-0.5") && labels.contains(&"-1.0"), "{labels:?}");
+        assert!(labels.contains(&"-12") && !labels.contains(&"-12.0"), "{labels:?}");
+    }
+
+    #[test]
+    fn position_formats() {
+        assert_eq!(format_position(48_000.0 * 61.5, 48_000, TimeFormat::Time), "1:01.500");
+        assert_eq!(format_position(48_000.0, 48_000, TimeFormat::Samples), "48000");
+        assert_eq!(format_position(24_000.0, 48_000, TimeFormat::Decimal), "0.500");
     }
 
     #[test]

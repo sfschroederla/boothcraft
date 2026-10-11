@@ -14,6 +14,8 @@ pub struct OpenFile {
     pub saved_at: usize,
     /// Bumped on every change to the visible document, so the engine knows when to resync.
     pub revision: u64,
+    /// A frame the waveform should scroll into view on its next draw.
+    pub reveal_request: Option<usize>,
 }
 
 impl OpenFile {
@@ -31,6 +33,7 @@ impl OpenFile {
             },
             saved_at: 0,
             revision: 0,
+            reveal_request: None,
         }
     }
 

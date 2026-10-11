@@ -1,3 +1,4 @@
+use crate::icons::{self, Icon};
 use crate::meters::Meters;
 use crate::ops::OpenFile;
 use crate::view::format_time;
@@ -282,6 +283,9 @@ impl State {
             )
         });
         let space = !ctx.egui_wants_keyboard_input() && keys(Modifiers::NONE, Key::Space);
+        let typing = ctx.egui_wants_keyboard_input();
+        let home = !typing && keys(Modifiers::NONE, Key::Home);
+        let end = !typing && keys(Modifiers::NONE, Key::End);
         let clips = &mut self.clips;
         if let Some(f) = self.files.get_mut(self.active) {
             if select_all {
@@ -302,6 +306,13 @@ impl State {
         }
         if space {
             self.toggle_play();
+        }
+        if home {
+            self.go_to(0);
+        }
+        if end {
+            let frames = self.files.get(self.active).map_or(0, |f| f.doc().frames());
+            self.go_to(frames);
         }
     }
 
@@ -479,18 +490,47 @@ impl State {
 
     fn transport_bar(&mut self, ui: &mut egui::Ui) {
         let playing = self.shared.as_ref().is_some_and(|s| s.is_playing());
+        let has_file = !self.files.is_empty();
         ui.horizontal(|ui| {
-            if ui
-                .button(if playing { "⏸ Pause" } else { "▶ Play" })
-                .clicked()
-            {
-                self.toggle_play();
-            }
-            if ui.button("⏹ Stop").clicked() {
-                self.stop();
-            }
-            ui.toggle_value(&mut self.looping, "🔁 Loop");
-            ui.toggle_value(&mut self.follow, "Follow");
+            ui.add_enabled_ui(has_file, |ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                if icons::button(ui, Icon::ToStart, false, "Go to start (Home)").clicked() {
+                    self.go_to(0);
+                }
+                let (icon, tip) = if playing {
+                    (Icon::Pause, "Pause (Space)")
+                } else {
+                    (Icon::Play, "Play (Space)")
+                };
+                if icons::button(ui, icon, playing, tip).clicked() {
+                    self.toggle_play();
+                }
+                if icons::button(ui, Icon::Stop, false, "Stop").clicked() {
+                    self.stop();
+                }
+                let end = self.files.get(self.active).map_or(0, |f| f.doc().frames());
+                if icons::button(ui, Icon::ToEnd, false, "Go to end (End)").clicked() {
+                    self.go_to(end);
+                }
+                ui.add_space(6.0);
+                let tip = if self.looping {
+                    "Loop playback: on"
+                } else {
+                    "Loop playback: off"
+                };
+                if icons::button(ui, Icon::Loop, self.looping, tip).clicked() {
+                    self.looping = !self.looping;
+                }
+                let tip = if self.follow {
+                    "Follow playhead: on"
+                } else {
+                    "Follow playhead: off"
+                };
+                if icons::button(ui, Icon::Follow, self.follow, tip).clicked() {
+                    self.follow = !self.follow;
+                }
+            });
+            ui.add_space(10.0);
             if let Some(f) = self.files.get(self.active) {
                 let pos = self.playhead();
                 ui.monospace(format!(
@@ -500,6 +540,19 @@ impl State {
                 ));
             }
         });
+    }
+
+    /// Move the playhead and cursor to `frame`, clearing any selection.
+    fn go_to(&mut self, frame: usize) {
+        let Some(f) = self.files.get_mut(self.active) else {
+            return;
+        };
+        let frame = frame.min(f.doc().frames());
+        f.selection = Selection::cursor(frame);
+        f.reveal_request = Some(frame);
+        if let Some(s) = &self.shared {
+            s.seek(frame);
+        }
     }
 }
 

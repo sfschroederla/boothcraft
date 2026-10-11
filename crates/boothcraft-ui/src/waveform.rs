@@ -130,6 +130,9 @@ pub fn show(
     if let Some(cmd) = zoom_cmd {
         apply_zoom(file, cmd, total, width);
     }
+    if let Some(frame) = file.reveal_request.take() {
+        file.view.reveal(frame as f64, total, width);
+    }
     file.view.clamp(total, width);
 
     let ruler = Rect::from_min_size(pos2(body_left, outer.top()), vec2(width, RULER_H));
