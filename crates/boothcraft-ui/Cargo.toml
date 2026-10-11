@@ -1,0 +1,17 @@
+[package]
+name = "boothcraft-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+boothcraft-core.workspace = true
+boothcraft-io.workspace = true
+boothcraft-engine.workspace = true
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+egui_dock = "0.21"
+rfd = "0.15"
+egui = "0.36"

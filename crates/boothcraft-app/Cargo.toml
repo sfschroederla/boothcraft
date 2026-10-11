@@ -1,0 +1,12 @@
+[package]
+name = "boothcraft-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+boothcraft-ui.workspace = true
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }

@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/boothcraft-core",
+    "crates/boothcraft-io",
+    "crates/boothcraft-dsp",
+    "crates/boothcraft-engine",
+    "crates/boothcraft-ui",
+    "crates/boothcraft-app",
+    "crates/boothcraft-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/truefirestudios/boothcraft"
+rust-version = "1.80"
+
+[workspace.dependencies]
+boothcraft-core = { path = "crates/boothcraft-core" }
+boothcraft-io = { path = "crates/boothcraft-io" }
+boothcraft-dsp = { path = "crates/boothcraft-dsp" }
+boothcraft-engine = { path = "crates/boothcraft-engine" }
+boothcraft-ui = { path = "crates/boothcraft-ui" }
+thiserror = "2"
+proptest = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,18 @@
+[package]
+name = "boothcraft-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+boothcraft-core.workspace = true
+thiserror.workspace = true
+symphonia = { version = "0.5", features = ["all"] }
+hound = "3.5"
+flacenc = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
