@@ -5,6 +5,7 @@ members = [
     "crates/boothcraft-io",
     "crates/boothcraft-dsp",
     "crates/boothcraft-engine",
+    "crates/boothcraft-plugin",
     "crates/boothcraft-ui",
     "crates/boothcraft-app",
     "crates/boothcraft-cli",
@@ -22,6 +23,7 @@ boothcraft-core = { path = "crates/boothcraft-core" }
 boothcraft-io = { path = "crates/boothcraft-io" }
 boothcraft-dsp = { path = "crates/boothcraft-dsp" }
 boothcraft-engine = { path = "crates/boothcraft-engine" }
+boothcraft-plugin = { path = "crates/boothcraft-plugin" }
 boothcraft-ui = { path = "crates/boothcraft-ui" }
 thiserror = "2"
 proptest = "1"

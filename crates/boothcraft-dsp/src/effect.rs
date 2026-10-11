@@ -33,6 +33,13 @@ pub trait Effect: Send {
         0
     }
 
+    /// Called on the UI thread, never the audio thread, when the rack holding this effect is
+    /// being torn down. An effect that owns something that must be released on the main thread
+    /// (a plugin's processor) hands it over, tagged with its slot, instead of dropping it.
+    fn retire(&mut self) -> Option<(crate::plugin_ref::SlotId, Box<dyn std::any::Any + Send>)> {
+        None
+    }
+
     fn set_param(&mut self, index: usize, value: f32) {
         if let Some(spec) = self.specs().get(index) {
             let v = spec.clamp(value);

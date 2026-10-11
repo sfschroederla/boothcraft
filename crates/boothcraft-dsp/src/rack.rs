@@ -81,7 +81,7 @@ impl RackDesc {
         self.slots
             .iter()
             .flatten()
-            .any(|s| registry::is_plugin_id(&s.effect))
+            .any(|s| s.plugin.is_some() || registry::is_plugin_id(&s.effect))
     }
 }
 
