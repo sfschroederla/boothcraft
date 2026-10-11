@@ -28,8 +28,16 @@ cargo test --workspace
 | `boothcraft-app` | GUI binary |
 | `boothcraft-cli` | Headless `info` / `convert` |
 
+## macOS app bundle
+
+```sh
+./scripts/macos_bundle.sh        # builds only boothcraft-app, not boothcraft-cli
+open target/release/bundle/osx/Boothcraft.app
+```
+
 ## Recording on macOS
 
-Recording uses the default input device. When run from a terminal, the app inherits that terminal's
-microphone permission (System Settings > Privacy & Security > Microphone). Without it, macOS delivers
-silence. A bundled app with its own permission prompt comes with packaging (milestone 7).
+Recording uses the default input device. Run from a terminal, the app inherits that terminal's
+microphone permission (System Settings > Privacy & Security > Microphone); without it, macOS
+delivers silence. The bundled `.app` above declares its own `NSMicrophoneUsageDescription`, so macOS
+prompts for microphone access the first time it records, independent of the terminal's permission.
