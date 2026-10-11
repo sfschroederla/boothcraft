@@ -66,6 +66,7 @@ pub enum Action {
     SetWindow(StftWindow),
     SetColorMap(ColorMap),
     SetFreqAxis(FreqAxis),
+    ResetLayout,
     Invert,
     Reverse,
     Silence,
@@ -391,12 +392,18 @@ pub fn install() -> NativeMenu {
             &freq_axis_menu,
         ])
         .expect("static menu construction");
+    let reset_layout = MenuItem::new("Reset Panel Layout", true, None);
+    register(&reset_layout, Action::ResetLayout);
     view_menu
         .append_items(
             &view_modes
                 .iter()
                 .map(|i| i as &dyn muda::IsMenuItem)
                 .chain(std::iter::once(&spectral_settings as &dyn muda::IsMenuItem))
+                .chain([
+                    &PredefinedMenuItem::separator() as &dyn muda::IsMenuItem,
+                    &reset_layout,
+                ])
                 .collect::<Vec<_>>(),
         )
         .expect("static menu construction");

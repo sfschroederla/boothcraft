@@ -25,7 +25,8 @@ use boothcraft_io::{BitDepth, Format, WriteOptions};
 use egui::{Event, Key, KeyboardShortcut, Modifiers};
 use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::{mpsc, Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Tab {
@@ -143,10 +144,56 @@ struct State {
     apply_queue: std::collections::VecDeque<(usize, String, ApplyKind)>,
     /// Most-recently-opened first, capped at [`RECENT_FILES_MAX`]; persisted across launches.
     recent_files: Vec<PathBuf>,
+    /// Files currently decoding on a worker thread (see `open`/`poll_open_jobs`); more than one
+    /// can run at a time (e.g. picking several files at once, or clicking through Recent quickly).
+    open_jobs: Vec<OpenJob>,
 }
 
 /// Longest "File > Open Recent" list kept.
 const RECENT_FILES_MAX: usize = 10;
+
+/// Decodes one file on a worker thread so opening it (however long that takes) never blocks the
+/// UI thread, however it was requested: the file dialog, drag-and-drop, Open Recent, or a path on
+/// the command line.
+struct OpenJob {
+    path: PathBuf,
+    progress: Arc<AtomicU32>,
+    rx: mpsc::Receiver<Result<Document, String>>,
+}
+
+impl OpenJob {
+    fn spawn(path: PathBuf) -> OpenJob {
+        let progress = Arc::new(AtomicU32::new(0));
+        let p = progress.clone();
+        let (tx, rx) = mpsc::channel();
+        let read_path = path.clone();
+        std::thread::spawn(move || {
+            let result = boothcraft_io::read_with_progress(&read_path, |done, total| {
+                if let Some(total) = total.filter(|&t| t > 0) {
+                    p.store(((done as f64 / total as f64) * 1000.0) as u32, Relaxed);
+                }
+            })
+            .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        OpenJob { path, progress, rx }
+    }
+
+    /// 0.0..=1.0; stays at 0 for the whole open if the container doesn't declare a frame count.
+    fn progress(&self) -> f32 {
+        self.progress.load(Relaxed) as f32 / 1000.0
+    }
+
+    fn poll(&self) -> Option<Result<Document, String>> {
+        match self.rx.try_recv() {
+            Ok(r) => Some(r),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                Some(Err("decode thread ended unexpectedly".into()))
+            }
+        }
+    }
+}
 
 pub struct BoothcraftApp {
     dock: DockState<Tab>,
@@ -273,6 +320,7 @@ impl BoothcraftApp {
             match_panel: MatchLoudnessPanel::default(),
             apply_queue: Default::default(),
             recent_files,
+            open_jobs: Vec::new(),
         };
         for p in paths {
             state.open(&p);
@@ -288,24 +336,54 @@ impl BoothcraftApp {
 }
 
 impl State {
+    /// Starts decoding `path` on a worker thread; see `poll_open_jobs` for where it lands once
+    /// done. Never blocks, regardless of the file's size.
     fn open(&mut self, path: &Path) {
-        match boothcraft_io::read(path) {
-            Ok(doc) => {
-                let name = path
-                    .file_name()
-                    .map_or_else(|| "untitled".into(), |n| n.to_string_lossy().into_owned());
-                self.status = format!(
-                    "Opened {name}: {} ch, {} Hz, {}",
-                    doc.channel_count(),
-                    doc.sample_rate,
-                    format_time(doc.frames() as f64, doc.sample_rate)
-                );
-                self.files
-                    .push(OpenFile::new(name, Some(path.to_path_buf()), doc));
-                self.set_active(self.files.len() - 1);
-                self.remember_recent(path);
+        let name = path
+            .file_name()
+            .map_or_else(|| "untitled".into(), |n| n.to_string_lossy().into_owned());
+        self.status = format!("Opening {name}…");
+        self.open_jobs.push(OpenJob::spawn(path.to_path_buf()));
+    }
+
+    /// Picks up any finished (or failed) decode started by `open`, adding it as a new open file.
+    /// Call once per frame.
+    fn poll_open_jobs(&mut self, ctx: &egui::Context) {
+        if self.open_jobs.is_empty() {
+            return;
+        }
+        let mut i = 0;
+        while i < self.open_jobs.len() {
+            match self.open_jobs[i].poll() {
+                None => i += 1,
+                Some(result) => {
+                    let job = self.open_jobs.remove(i);
+                    let name = job
+                        .path
+                        .file_name()
+                        .map_or_else(|| "untitled".into(), |n| n.to_string_lossy().into_owned());
+                    match result {
+                        Ok(doc) => {
+                            self.status = format!(
+                                "Opened {name}: {} ch, {} Hz, {}",
+                                doc.channel_count(),
+                                doc.sample_rate,
+                                format_time(doc.frames() as f64, doc.sample_rate)
+                            );
+                            self.files
+                                .push(OpenFile::new(name, Some(job.path.clone()), doc));
+                            self.set_active(self.files.len() - 1);
+                            self.remember_recent(&job.path);
+                        }
+                        Err(e) => {
+                            self.status = format!("Could not open {}: {e}", job.path.display())
+                        }
+                    }
+                }
             }
-            Err(e) => self.status = format!("Could not open {}: {e}", path.display()),
+        }
+        if !self.open_jobs.is_empty() {
+            ctx.request_repaint();
         }
     }
 
@@ -326,6 +404,20 @@ impl State {
         }
         self.active = i;
         self.synced = None;
+    }
+
+    /// Close the open file at `i` (used by File > Close for the active file, and by the Files
+    /// panel's right-click Close). Does nothing if `i` is out of range.
+    fn close_file(&mut self, i: usize) {
+        if i >= self.files.len() {
+            return;
+        }
+        self.files.remove(i);
+        if self.active >= i {
+            self.active = self.active.saturating_sub(1);
+        }
+        self.synced = None;
+        self.stop();
     }
 
     fn file(&mut self) -> Option<&mut OpenFile> {
@@ -934,6 +1026,7 @@ impl State {
             Action::SetWindow(w) => self.display.spectral.window = w,
             Action::SetColorMap(m) => self.display.spectral.color_map = m,
             Action::SetFreqAxis(a) => self.display.spectral.freq_axis = a,
+            Action::ResetLayout => *dock = default_dock(),
             Action::Invert => {
                 if self.active < self.files.len() {
                     self.files[self.active].invert();
@@ -1023,12 +1116,7 @@ impl State {
                     ui.close();
                 }
                 if ui.button("Close").clicked() {
-                    if self.active < self.files.len() {
-                        self.files.remove(self.active);
-                        self.active = self.active.saturating_sub(1);
-                        self.synced = None;
-                        self.stop();
-                    }
+                    self.close_file(self.active);
                     ui.close();
                 }
             });
@@ -1196,6 +1284,11 @@ impl State {
                         );
                     });
                 });
+                ui.separator();
+                if ui.button("Reset Panel Layout").clicked() {
+                    *dock = default_dock();
+                    ui.close();
+                }
             });
             ui.add_enabled_ui(has, |ui| {
                 ui.menu_button("Effects", |ui| {
@@ -1774,13 +1867,23 @@ impl TabViewer for Viewer<'_> {
             }
             Tab::Files => {
                 let mut pick = None;
+                let mut close = None;
                 for (i, f) in s.files.iter().enumerate() {
                     let label = format!("{}{}", f.name, if f.dirty() { " •" } else { "" });
-                    if ui.selectable_label(i == s.active, label).clicked() {
+                    let resp = ui.selectable_label(i == s.active, label);
+                    if resp.clicked() {
                         pick = Some(i);
                     }
+                    resp.context_menu(|ui| {
+                        if ui.button("Close").clicked() {
+                            close = Some(i);
+                            ui.close();
+                        }
+                    });
                 }
-                if let Some(i) = pick {
+                if let Some(i) = close {
+                    s.close_file(i);
+                } else if let Some(i) = pick {
                     s.set_active(i);
                 }
             }
@@ -1921,6 +2024,13 @@ impl eframe::App for BoothcraftApp {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.state.status);
+                for job in &self.state.open_jobs {
+                    ui.add(
+                        egui::ProgressBar::new(job.progress())
+                            .desired_width(80.0)
+                            .show_percentage(),
+                    );
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let store = boothcraft_core::BlockStore::global();
                     let mb = |b: u64| b / (1024 * 1024);
@@ -1942,6 +2052,7 @@ impl eframe::App for BoothcraftApp {
                 .show_inside(ui, &mut Viewer { s: &mut self.state });
         });
         self.state.dialogs(&ctx);
+        self.state.poll_open_jobs(&ctx);
         self.state.effects_frame(&ctx);
         self.state.generator_frame(&ctx);
         self.state.sync_engine();
