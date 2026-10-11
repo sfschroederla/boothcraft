@@ -16,7 +16,10 @@ pub enum Icon {
     Rewind,
     FastForward,
     Record,
+    PrevMarker,
+    NextMarker,
     Loop,
+    SkipSelection,
     Follow,
     AmpZoomIn,
     AmpZoomOut,
@@ -125,6 +128,25 @@ pub fn paint(p: &egui::Painter, icon: Icon, r: Rect, color: Color32) {
         Icon::Record => {
             p.circle_filled(c, s * 0.8, color);
         }
+        Icon::PrevMarker | Icon::NextMarker => {
+            // A marker flag on one side and an arrow pointing toward it.
+            let flip = if icon == Icon::PrevMarker { 1.0 } else { -1.0 };
+            let pole = c.x - s * 0.85 * flip;
+            p.line_segment([pos2(pole, c.y - s), pos2(pole, c.y + s)], thin);
+            let flag_end = pole + s * 0.8 * flip;
+            p.rect_filled(
+                Rect::from_two_pos(pos2(pole, c.y - s), pos2(flag_end, c.y - s * 0.35)),
+                0.0,
+                color,
+            );
+            let tip = c.x + s * 0.05 * flip;
+            let back = c.x + s * flip;
+            fill(vec![
+                pos2(back, c.y - s * 0.1),
+                pos2(tip, c.y + s * 0.4),
+                pos2(back, c.y + s * 0.9),
+            ]);
+        }
         Icon::Loop => {
             let body = Rect::from_center_size(c, vec2(s * 2.0, s * 1.3));
             p.rect_stroke(body, 3.0, line, StrokeKind::Middle);
@@ -139,6 +161,25 @@ pub fn paint(p: &egui::Painter, icon: Icon, r: Rect, color: Color32) {
                 pos2(c.x - s * 0.1, bottom - s * 0.4),
                 pos2(c.x - s * 0.1, bottom + s * 0.4),
                 pos2(c.x - s * 0.7, bottom),
+            ]);
+        }
+        Icon::SkipSelection => {
+            // A selection (brackets) with an arrow arcing over it.
+            for x in [c.x - s * 0.45, c.x + s * 0.45] {
+                p.line_segment([pos2(x, c.y - s * 0.1), pos2(x, c.y + s)], thin);
+            }
+            let arc: Vec<Pos2> = (0..=12)
+                .map(|k| {
+                    let a = std::f32::consts::PI * (1.0 - k as f32 / 12.0);
+                    pos2(c.x + a.cos() * s * 0.85, c.y - s * 0.05 - a.sin() * s * 0.8)
+                })
+                .collect();
+            let tip = *arc.last().unwrap_or(&c);
+            p.add(Shape::line(arc, thin));
+            fill(vec![
+                tip + vec2(-s * 0.35, -s * 0.05),
+                tip + vec2(s * 0.35, -s * 0.05),
+                tip + vec2(0.0, s * 0.45),
             ]);
         }
         Icon::Follow => {
@@ -255,6 +296,7 @@ mod tests {
             Icon::ToStart,
             Icon::ToEnd,
             Icon::Loop,
+            Icon::SkipSelection,
             Icon::Follow,
         ];
         let mut rects = Vec::new();

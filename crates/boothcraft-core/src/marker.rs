@@ -29,3 +29,17 @@ impl Marker {
         }
     }
 }
+
+impl Marker {
+    /// Last frame covered by the marker (equal to `at` for a cue).
+    pub fn end(&self) -> usize {
+        match self.kind {
+            MarkerKind::Cue => self.at,
+            MarkerKind::Range { len } => self.at + len,
+        }
+    }
+
+    pub fn is_range(&self) -> bool {
+        matches!(self.kind, MarkerKind::Range { .. })
+    }
+}

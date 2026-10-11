@@ -1,0 +1,363 @@
+//! The Effects Rack: up to 16 effects in series with input/output gain and a wet/dry mix.
+
+use crate::effect::Effect;
+use crate::param::db_to_gain;
+use crate::registry;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+
+pub const SLOTS: usize = 16;
+
+/// A rack's settings, without any processing state: what the UI edits, presets store, and both
+/// preview and Apply are built from.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RackDesc {
+    pub slots: Vec<Option<SlotDesc>>,
+    pub input_gain_db: f32,
+    pub output_gain_db: f32,
+    /// Wet amount, 0..=1.
+    pub mix: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SlotDesc {
+    pub effect: String,
+    pub values: Vec<f32>,
+    pub bypass: bool,
+}
+
+impl Default for RackDesc {
+    fn default() -> Self {
+        RackDesc {
+            slots: vec![None; SLOTS],
+            input_gain_db: 0.0,
+            output_gain_db: 0.0,
+            mix: 1.0,
+        }
+    }
+}
+
+impl RackDesc {
+    /// A rack holding a single effect at its defaults (used by the per-effect dialogs).
+    pub fn single(effect_id: &str) -> Option<RackDesc> {
+        let mut d = RackDesc::default();
+        d.slots[0] = Some(SlotDesc::new(effect_id)?);
+        Some(d)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(Option::is_none)
+    }
+}
+
+impl SlotDesc {
+    pub fn new(effect_id: &str) -> Option<SlotDesc> {
+        let e = registry::create(effect_id)?;
+        Some(SlotDesc {
+            effect: effect_id.to_string(),
+            values: e.values().to_vec(),
+            bypass: false,
+        })
+    }
+}
+
+struct Slot {
+    effect: Box<dyn Effect>,
+    bypass: bool,
+}
+
+/// A prepared rack. Construct (allocate) off the audio thread; `process_*` never allocates.
+pub struct Rack {
+    slots: Vec<Option<Slot>>,
+    input_gain: f32,
+    output_gain: f32,
+    mix: f32,
+    channels: usize,
+    max_block: usize,
+    dry: Vec<Vec<f32>>,
+    planar: Vec<Vec<f32>>,
+}
+
+impl Rack {
+    pub fn new(desc: &RackDesc, sample_rate: f32, channels: usize, max_block: usize) -> Rack {
+        let channels = channels.max(1);
+        let slots = desc
+            .slots
+            .iter()
+            .map(|s| {
+                let s = s.as_ref()?;
+                let mut effect = registry::create(&s.effect)?;
+                effect.set_all(&s.values);
+                effect.prepare(sample_rate, channels, max_block);
+                effect.reset();
+                Some(Slot {
+                    effect,
+                    bypass: s.bypass,
+                })
+            })
+            .collect();
+        Rack {
+            slots,
+            input_gain: db_to_gain(desc.input_gain_db),
+            output_gain: db_to_gain(desc.output_gain_db),
+            mix: desc.mix.clamp(0.0, 1.0),
+            channels,
+            max_block,
+            dry: vec![vec![0.0; max_block]; channels],
+            planar: vec![vec![0.0; max_block]; channels],
+        }
+    }
+
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    pub fn set_param(&mut self, slot: usize, index: usize, value: f32) {
+        if let Some(Some(s)) = self.slots.get_mut(slot) {
+            s.effect.set_param(index, value);
+        }
+    }
+
+    pub fn set_bypass(&mut self, slot: usize, bypass: bool) {
+        if let Some(Some(s)) = self.slots.get_mut(slot) {
+            s.bypass = bypass;
+        }
+    }
+
+    pub fn set_gains(&mut self, input_db: f32, output_db: f32, mix: f32) {
+        self.input_gain = db_to_gain(input_db);
+        self.output_gain = db_to_gain(output_db);
+        self.mix = mix.clamp(0.0, 1.0);
+    }
+
+    /// Total delay of the active effects, in frames.
+    pub fn latency(&self) -> usize {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|s| !s.bypass)
+            .map(|s| s.effect.latency())
+            .sum()
+    }
+
+    pub fn reset(&mut self) {
+        for s in self.slots.iter_mut().flatten() {
+            s.effect.reset();
+        }
+    }
+
+    /// Process planar audio. Longer buffers are processed in `max_block` pieces.
+    pub fn process(&mut self, buf: &mut [&mut [f32]]) {
+        let n = buf.first().map_or(0, |c| c.len());
+        let mut at = 0;
+        while at < n {
+            let len = (n - at).min(self.max_block);
+            for (c, ch) in buf.iter().enumerate().take(self.channels) {
+                self.planar[c][..len].copy_from_slice(&ch[at..at + len]);
+            }
+            self.process_planar(len);
+            for (c, ch) in buf.iter_mut().enumerate().take(self.channels) {
+                ch[at..at + len].copy_from_slice(&self.planar[c][..len]);
+            }
+            at += len;
+        }
+    }
+
+    /// Process interleaved audio with the rack's channel count.
+    pub fn process_interleaved(&mut self, out: &mut [f32]) {
+        let ch = self.channels;
+        let frames = out.len() / ch;
+        let mut at = 0;
+        while at < frames {
+            let len = (frames - at).min(self.max_block);
+            for i in 0..len {
+                for c in 0..ch {
+                    self.planar[c][i] = out[(at + i) * ch + c];
+                }
+            }
+            self.process_planar(len);
+            for i in 0..len {
+                for c in 0..ch {
+                    out[(at + i) * ch + c] = self.planar[c][i];
+                }
+            }
+            at += len;
+        }
+    }
+
+    fn process_planar(&mut self, len: usize) {
+        let (ig, og, mix) = (self.input_gain, self.output_gain, self.mix);
+        for ch in self.planar.iter_mut() {
+            ch[..len].iter_mut().for_each(|x| *x *= ig);
+        }
+        if mix < 1.0 {
+            for (d, p) in self.dry.iter_mut().zip(&self.planar) {
+                d[..len].copy_from_slice(&p[..len]);
+            }
+        }
+        // Up to 8 channels without allocating: borrow each channel's slice into a stack array.
+        let mut slices: [&mut [f32]; 8] = Default::default();
+        let n = self.planar.len().min(8);
+        for (dst, ch) in slices.iter_mut().zip(self.planar.iter_mut()) {
+            *dst = &mut ch[..len];
+        }
+        for slot in self.slots.iter_mut().flatten() {
+            if !slot.bypass {
+                slot.effect.process(&mut slices[..n]);
+            }
+        }
+        for (c, ch) in slices[..n].iter_mut().enumerate() {
+            for (i, x) in ch.iter_mut().enumerate() {
+                let wet = *x;
+                *x = if mix < 1.0 {
+                    (self.dry[c][i] * (1.0 - mix) + wet * mix) * og
+                } else {
+                    wet * og
+                };
+            }
+        }
+    }
+}
+
+/// Run `desc` over whole channels offline (Apply). Latency is compensated so the output lines
+/// up with the input. `progress` receives 0..=1000 (per mille); setting `cancel` stops early and
+/// returns `false`, leaving `chans` partly processed (callers discard them).
+pub fn render_offline(
+    desc: &RackDesc,
+    chans: &mut [Vec<f32>],
+    sample_rate: f32,
+    progress: &AtomicU32,
+    cancel: &AtomicBool,
+) -> bool {
+    const BLOCK: usize = 4096;
+    let n = chans.first().map_or(0, Vec::len);
+    let mut rack = Rack::new(desc, sample_rate, chans.len(), BLOCK);
+    let latency = rack.latency();
+    let total = n + latency;
+    let mut block: Vec<Vec<f32>> = vec![vec![0.0; BLOCK]; chans.len()];
+    let mut out: Vec<Vec<f32>> = vec![Vec::with_capacity(total); chans.len()];
+    let mut at = 0;
+    while at < total {
+        if cancel.load(Relaxed) {
+            return false;
+        }
+        let len = (total - at).min(BLOCK);
+        for (b, c) in block.iter_mut().zip(chans.iter()) {
+            for (i, x) in b[..len].iter_mut().enumerate() {
+                *x = c.get(at + i).copied().unwrap_or(0.0);
+            }
+        }
+        let mut slices: Vec<&mut [f32]> = block.iter_mut().map(|b| &mut b[..len]).collect();
+        rack.process(&mut slices);
+        for (o, b) in out.iter_mut().zip(&block) {
+            o.extend_from_slice(&b[..len]);
+        }
+        at += len;
+        progress.store((at * 1000 / total.max(1)) as u32, Relaxed);
+    }
+    for (c, o) in chans.iter_mut().zip(out) {
+        c.copy_from_slice(&o[latency..latency + n]);
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn amp_rack(db: f32) -> RackDesc {
+        let mut d = RackDesc::single("amplify").unwrap();
+        d.slots[0].as_mut().unwrap().values[0] = db;
+        d
+    }
+
+    fn render(desc: &RackDesc, input: &[f32]) -> Vec<f32> {
+        let mut chans = vec![input.to_vec()];
+        assert!(render_offline(
+            desc,
+            &mut chans,
+            48_000.0,
+            &AtomicU32::new(0),
+            &AtomicBool::new(false)
+        ));
+        chans.remove(0)
+    }
+
+    #[test]
+    fn neutral_rack_is_identity() {
+        let input: Vec<f32> = (0..10_000).map(|i| (i as f32 * 0.01).sin()).collect();
+        assert_eq!(render(&RackDesc::default(), &input), input);
+        assert_eq!(render(&amp_rack(0.0), &input), input);
+    }
+
+    #[test]
+    fn gain_mix_and_bypass() {
+        let input = vec![0.25f32; 5000];
+        let doubled = render(&amp_rack(20.0 * 2f32.log10()), &input);
+        assert!((doubled[4000] - 0.5).abs() < 1e-5);
+        let mut half_wet = amp_rack(20.0 * 2f32.log10());
+        half_wet.mix = 0.5;
+        assert!((render(&half_wet, &input)[4000] - 0.375).abs() < 1e-5);
+        let mut bypassed = amp_rack(20.0);
+        bypassed.slots[0].as_mut().unwrap().bypass = true;
+        bypassed.output_gain_db = -6.0;
+        assert!((render(&bypassed, &input)[10] - 0.25 * db_to_gain(-6.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn interleaved_matches_planar() {
+        let desc = amp_rack(-3.0);
+        let l: Vec<f32> = (0..3000).map(|i| (i as f32 * 0.02).sin()).collect();
+        let r: Vec<f32> = l.iter().map(|x| x * 0.5).collect();
+        let mut planar = Rack::new(&desc, 48_000.0, 2, 256);
+        let (mut a, mut b) = (l.clone(), r.clone());
+        planar.process(&mut [&mut a[..], &mut b[..]]);
+        let mut inter: Vec<f32> = l.iter().zip(&r).flat_map(|(x, y)| [*x, *y]).collect();
+        Rack::new(&desc, 48_000.0, 2, 256).process_interleaved(&mut inter);
+        for i in 0..3000 {
+            assert_eq!(inter[2 * i], a[i]);
+            assert_eq!(inter[2 * i + 1], b[i]);
+        }
+    }
+
+    #[test]
+    fn offline_render_compensates_latency() {
+        // A limiter that never engages must return the input exactly aligned.
+        let mut d = RackDesc::single("hard_limiter").unwrap();
+        d.slots[0].as_mut().unwrap().values[2] = 10.0;
+        let input: Vec<f32> = (0..20_000)
+            .map(|i| (i as f32 * 0.003).sin() * 0.25)
+            .collect();
+        let out = render(&d, &input);
+        let worst = out
+            .iter()
+            .zip(&input)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(worst < 1e-6, "misaligned by latency: {worst}");
+    }
+
+    #[test]
+    fn cancel_stops_rendering() {
+        let mut chans = vec![vec![0.0f32; 100_000]];
+        assert!(!render_offline(
+            &amp_rack(1.0),
+            &mut chans,
+            48_000.0,
+            &AtomicU32::new(0),
+            &AtomicBool::new(true)
+        ));
+    }
+
+    #[test]
+    fn unknown_effects_are_skipped() {
+        let mut d = RackDesc::default();
+        d.slots[3] = Some(SlotDesc {
+            effect: "no-such-effect".into(),
+            values: vec![],
+            bypass: false,
+        });
+        let input = vec![0.5f32; 100];
+        assert_eq!(render(&d, &input), input);
+    }
+}

@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 boothcraft-core.workspace = true
+boothcraft-dsp.workspace = true
 thiserror.workspace = true
 symphonia = { version = "0.5", features = ["all"] }
 hound = "3.5"

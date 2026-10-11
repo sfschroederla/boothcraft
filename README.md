@@ -4,13 +4,15 @@ An open-source, cross-platform audio editor in Rust, aiming for feature parity w
 editor of professional desktop audio tools. Multitrack sessions are out of scope.
 
 ## Status
-<img width="1392" height="904" alt="Screenshot 2026-10-11 at 00 14 50" src="https://github.com/user-attachments/assets/4ad31479-df69-4c21-8cc5-f7576343400b" />Early. Milestone 0 and part of milestone 1 are in place; see [docs/parity.md](docs/parity.md).
+<img width="1392" height="904" alt="Screenshot 2026-10-11 at 00 14 50" src="https://github.com/user-attachments/assets/4ad31479-df69-4c21-8cc5-f7576343400b" />Milestones 1 (the core editor, apart from a disk-backed block store) and 2 (the effects framework and first 22 effects) are in place. See [docs/parity.md](docs/parity.md).
 
 ## Build and run
 
 ```sh
 cargo run -p boothcraft-app -- path/to/file.wav   # GUI
 cargo run -p boothcraft-cli -- info file.flac     # headless tools
+cargo run -p boothcraft-cli -- effects            # list effects and parameters
+cargo run -p boothcraft-cli -- apply --effect hard_limiter --param ceiling=-1 in.wav out.wav
 cargo test --workspace
 ```
 
@@ -20,8 +22,14 @@ cargo test --workspace
 |---|---|
 | `boothcraft-core` | Immutable block storage, edits, selection, markers, undo history |
 | `boothcraft-io` | Decode (symphonia) and encode WAV / AIFF / FLAC |
-| `boothcraft-dsp` | Effects and analysis (not started) |
+| `boothcraft-dsp` | Effects, Effects Rack, presets, generators, loudness, sample-rate conversion, dither |
 | `boothcraft-engine` | Real-time output, transport, metering |
 | `boothcraft-ui` | egui panels, waveform view, edit commands |
 | `boothcraft-app` | GUI binary |
 | `boothcraft-cli` | Headless `info` / `convert` |
+
+## Recording on macOS
+
+Recording uses the default input device. When run from a terminal, the app inherits that terminal's
+microphone permission (System Settings > Privacy & Security > Microphone). Without it, macOS delivers
+silence. A bundled app with its own permission prompt comes with packaging (milestone 7).

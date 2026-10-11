@@ -54,7 +54,22 @@ impl Rope {
         self.blocks.push(block);
     }
 
-    pub fn push_samples(&mut self, samples: &[f32]) {
+    /// Append samples, first topping up a partial last block so that many small appends
+    /// (live recording) still produce full-size blocks.
+    pub fn push_samples(&mut self, mut samples: &[f32]) {
+        if let Some(last) = self.blocks.last() {
+            let room = BLOCK_FRAMES - last.len();
+            if room > 0 && !samples.is_empty() {
+                let take = room.min(samples.len());
+                let mut merged = Vec::with_capacity(last.len() + take);
+                merged.extend_from_slice(last.samples());
+                merged.extend_from_slice(&samples[..take]);
+                self.len -= last.len();
+                self.blocks.pop();
+                self.push_block(Block::new(merged));
+                samples = &samples[take..];
+            }
+        }
         for chunk in samples.chunks(BLOCK_FRAMES) {
             self.push_block(Block::new(chunk.to_vec()));
         }

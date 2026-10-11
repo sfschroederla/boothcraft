@@ -1,3 +1,4 @@
+use crate::rackctl::{rack_channel, RackControl, RackLink};
 use crate::shared::{Renderer, Shared};
 use boothcraft_core::Document;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -8,6 +9,8 @@ use std::sync::Arc;
 pub enum EngineError {
     #[error("no output device available")]
     NoDevice,
+    #[error("no input device available")]
+    NoInputDevice,
     #[error("audio device error: {0}")]
     Device(String),
 }
@@ -16,8 +19,31 @@ pub enum EngineError {
 pub struct Engine {
     shared: Arc<Shared>,
     _stream: Stream,
+    rack: Option<RackControl>,
+    tap: Option<Tap>,
     pub device_name: String,
     pub sample_rate: u32,
+    pub channels: usize,
+}
+
+/// UI-side end of the output tap.
+pub struct Tap {
+    pub consumer: rtrb::Consumer<f32>,
+    pub channels: usize,
+    pub sample_rate: u32,
+}
+
+impl Tap {
+    /// Move everything available into `out`.
+    pub fn drain(&mut self, out: &mut Vec<f32>) {
+        let n = self.consumer.slots();
+        if let Ok(chunk) = self.consumer.read_chunk(n) {
+            let (a, b) = chunk.as_slices();
+            out.extend_from_slice(a);
+            out.extend_from_slice(b);
+            chunk.commit_all();
+        }
+    }
 }
 
 /// Frames rendered per call, bounding the callback's scratch buffer.
@@ -37,11 +63,14 @@ impl Engine {
             .map(|i| i.to_string())
             .unwrap_or_else(|_| "default".into());
         let shared = Shared::new();
+        let (rack, link) = rack_channel(config.sample_rate, config.channels as usize);
+        let (tap_tx, tap_rx) =
+            rtrb::RingBuffer::new(config.sample_rate as usize * config.channels as usize * 2);
         let stream = match format {
-            SampleFormat::F32 => build::<f32>(&device, &config, &shared),
-            SampleFormat::I16 => build::<i16>(&device, &config, &shared),
-            SampleFormat::I32 => build::<i32>(&device, &config, &shared),
-            SampleFormat::U16 => build::<u16>(&device, &config, &shared),
+            SampleFormat::F32 => build::<f32>(&device, &config, &shared, link, tap_tx),
+            SampleFormat::I16 => build::<i16>(&device, &config, &shared, link, tap_tx),
+            SampleFormat::I32 => build::<i32>(&device, &config, &shared, link, tap_tx),
+            SampleFormat::U16 => build::<u16>(&device, &config, &shared, link, tap_tx),
             other => Err(EngineError::Device(format!(
                 "unsupported sample format {other}"
             ))),
@@ -52,9 +81,26 @@ impl Engine {
         Ok(Engine {
             shared,
             _stream: stream,
+            rack: Some(rack),
+            tap: Some(Tap {
+                consumer: tap_rx,
+                channels: config.channels as usize,
+                sample_rate: config.sample_rate,
+            }),
             device_name,
             sample_rate: config.sample_rate,
+            channels: config.channels as usize,
         })
+    }
+
+    /// The output tap (everything played, interleaved); can be taken once.
+    pub fn take_tap(&mut self) -> Option<Tap> {
+        self.tap.take()
+    }
+
+    /// The preview-rack control; can be taken once.
+    pub fn take_rack_control(&mut self) -> Option<RackControl> {
+        self.rack.take()
     }
 
     /// Handle for the UI to control playback; cheap to clone.
@@ -71,6 +117,8 @@ fn build<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     shared: &Arc<Shared>,
+    link: RackLink,
+    tap: rtrb::Producer<f32>,
 ) -> Result<Stream, EngineError>
 where
     T: SizedSample + FromSample<f32>,
@@ -78,6 +126,8 @@ where
     let channels = config.channels as usize;
     let rate = config.sample_rate;
     let mut renderer = Renderer::new(shared.clone());
+    renderer.attach_rack(link);
+    renderer.attach_tap(tap);
     let mut buf = vec![0.0f32; MAX_FRAMES * channels];
     device
         .build_output_stream(

@@ -3,6 +3,7 @@
 pub mod block;
 pub mod clipboard;
 pub mod document;
+pub mod fade;
 pub mod history;
 pub mod marker;
 pub mod rope;
@@ -10,7 +11,8 @@ pub mod selection;
 
 pub use block::{Block, Peak, BLOCK_FRAMES, PEAK_STRIDE};
 pub use clipboard::Clipboards;
-pub use document::{ChannelMask, Document};
+pub use document::{ChannelMask, Document, ZeroDir};
+pub use fade::{fade_gain, FadeShape};
 pub use history::History;
 pub use marker::{Marker, MarkerKind};
 pub use rope::Rope;

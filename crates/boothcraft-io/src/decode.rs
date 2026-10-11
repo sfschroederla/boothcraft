@@ -78,5 +78,16 @@ pub fn read(path: &Path) -> Result<Document> {
     if let Some(n) = declared_frames {
         interleaved.truncate((n as usize).saturating_mul(ch).min(interleaved.len()));
     }
-    Ok(Document::from_interleaved(rate, ch, &interleaved))
+    let mut doc = Document::from_interleaved(rate, ch, &interleaved);
+    let is_wav = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("wav") || e.eq_ignore_ascii_case("wave"));
+    if is_wav {
+        // Markers are best-effort: a malformed chunk must not stop the audio from opening.
+        for m in crate::riff::read_markers(path).unwrap_or_default() {
+            doc.add_marker(m);
+        }
+    }
+    Ok(doc)
 }

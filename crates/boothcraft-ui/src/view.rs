@@ -137,6 +137,16 @@ pub fn extend_anchor(sel: Selection, at: usize) -> usize {
     }
 }
 
+/// The candidate nearest to `frame` if it lies within `tol_frames`, otherwise `frame` unchanged.
+pub fn snap(frame: f64, candidates: &[f64], tol_frames: f64) -> f64 {
+    candidates
+        .iter()
+        .copied()
+        .filter(|c| (c - frame).abs() <= tol_frames)
+        .min_by(|a, b| (a - frame).abs().total_cmp(&(b - frame).abs()))
+        .unwrap_or(frame)
+}
+
 pub fn db(linear: f32) -> f32 {
     20.0 * linear.max(1e-6).log10()
 }
@@ -218,6 +228,15 @@ mod tests {
         assert_eq!(extend_anchor(sel, 350), 100);
         assert_eq!(extend_anchor(sel, 50), 300);
         assert_eq!(extend_anchor(Selection::cursor(200), 500), 200);
+    }
+
+    #[test]
+    fn snap_picks_nearest_candidate_in_range() {
+        let c = [100.0, 130.0, 500.0];
+        assert_eq!(snap(118.0, &c, 20.0), 130.0);
+        assert_eq!(snap(112.0, &c, 20.0), 100.0);
+        assert_eq!(snap(300.0, &c, 20.0), 300.0, "nothing in range");
+        assert_eq!(snap(300.0, &[], 20.0), 300.0);
     }
 
     #[test]

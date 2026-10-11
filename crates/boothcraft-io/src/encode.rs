@@ -33,13 +33,43 @@ impl BitDepth {
 pub struct WriteOptions {
     pub format: Format,
     pub depth: BitDepth,
+    /// Resample to this rate on export (`None` keeps the document's rate).
+    pub sample_rate: Option<u32>,
+    /// Add TPDF dither when writing integer samples.
+    pub dither: bool,
+}
+
+impl WriteOptions {
+    pub fn new(format: Format, depth: BitDepth) -> WriteOptions {
+        WriteOptions {
+            format,
+            depth,
+            sample_rate: None,
+            dither: false,
+        }
+    }
 }
 
 pub fn write(doc: &Document, path: &Path, opts: &WriteOptions) -> Result<()> {
-    let samples = doc.to_interleaved(0..doc.frames());
+    let resampled;
+    let doc = match opts.sample_rate {
+        Some(rate) if rate != doc.sample_rate => {
+            resampled = boothcraft_dsp::convert::resample_document(doc, rate);
+            &resampled
+        }
+        _ => doc,
+    };
+    let mut samples = doc.to_interleaved(0..doc.frames());
+    if opts.dither && opts.depth != BitDepth::Float32 {
+        boothcraft_dsp::convert::Dither::new(0x9E37_79B9)
+            .apply(&mut samples, opts.depth.bits() as u32);
+    }
     let ch = doc.channel_count();
     match opts.format {
-        Format::Wav => write_wav(path, doc.sample_rate, ch, opts.depth, &samples),
+        Format::Wav => {
+            write_wav(path, doc.sample_rate, ch, opts.depth, &samples)?;
+            crate::riff::append_markers(path, &doc.markers)
+        }
         Format::Aiff => {
             if opts.depth == BitDepth::Float32 {
                 return Err(Error::Encode(

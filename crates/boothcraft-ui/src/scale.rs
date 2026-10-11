@@ -46,15 +46,33 @@ pub enum TimeFormat {
     Decimal,
     Samples,
     Smpte,
+    /// Bars and beats at a tempo. BPM is stored ×100 so the type stays `Eq`.
+    BarsBeats {
+        bpm_x100: u32,
+        beats_per_bar: u32,
+    },
 }
 
 impl TimeFormat {
-    pub const ALL: [TimeFormat; 4] = [
+    pub const ALL: [TimeFormat; 5] = [
         TimeFormat::Time,
         TimeFormat::Decimal,
         TimeFormat::Samples,
         TimeFormat::Smpte,
+        TimeFormat::bars_beats(120.0, 4),
     ];
+
+    pub const fn bars_beats(bpm: f32, beats_per_bar: u32) -> TimeFormat {
+        TimeFormat::BarsBeats {
+            bpm_x100: (bpm * 100.0) as u32,
+            beats_per_bar,
+        }
+    }
+
+    /// Same format, ignoring tempo settings.
+    pub fn same_kind(self, other: TimeFormat) -> bool {
+        std::mem::discriminant(&self) == std::mem::discriminant(&other)
+    }
 
     /// Short name shown in the ruler's corner.
     pub fn short(self) -> &'static str {
@@ -63,6 +81,7 @@ impl TimeFormat {
             TimeFormat::Decimal => "sec",
             TimeFormat::Samples => "samples",
             TimeFormat::Smpte => "smpte",
+            TimeFormat::BarsBeats { .. } => "bars",
         }
     }
 
@@ -72,11 +91,18 @@ impl TimeFormat {
             TimeFormat::Decimal => "Decimal seconds",
             TimeFormat::Samples => "Samples",
             TimeFormat::Smpte => "SMPTE 30 fps",
+            TimeFormat::BarsBeats { .. } => "Bars and Beats",
         }
     }
 }
 
 pub const SMPTE_FPS: f64 = 30.0;
+
+/// Frames per beat and beats per bar for a bars/beats format.
+fn beat_grid(rate: u32, bpm_x100: u32, beats_per_bar: u32) -> (f64, u32) {
+    let bpm = (bpm_x100.max(100) as f64) / 100.0;
+    (rate as f64 * 60.0 / bpm, beats_per_bar.max(1))
+}
 
 /// One horizontal amplitude gridline. `value` is a linear amplitude in `0..=1`.
 #[derive(Clone, Debug, PartialEq)]
@@ -211,6 +237,28 @@ fn seconds_step(min_secs: f64) -> (f64, u32) {
 pub fn time_ticks(v: &View, width_px: f32, rate: u32, fmt: TimeFormat, label_px: f32) -> Vec<Tick> {
     let rate_f = rate as f64;
     let (major_frames, div, step_secs) = match fmt {
+        TimeFormat::BarsBeats {
+            bpm_x100,
+            beats_per_bar,
+        } => {
+            let (beat, bpb) = beat_grid(rate, bpm_x100, beats_per_bar);
+            let min = v.frames_per_px * label_px as f64;
+            if beat >= min {
+                // Label every beat, with sixteenth-note minor ticks.
+                (beat, 4, beat / rate_f)
+            } else {
+                let bar = beat * bpb as f64;
+                let mut n = 1u32;
+                while (n as f64) * bar < min {
+                    n *= 2;
+                }
+                (
+                    n as f64 * bar,
+                    if n == 1 { bpb } else { n.min(16) },
+                    n as f64 * bar / rate_f,
+                )
+            }
+        }
         TimeFormat::Samples => {
             let (step, div) = decimal_step(v.frames_per_px * label_px as f64, 1.0);
             let div = if step < 10.0 {
@@ -278,6 +326,19 @@ pub fn format_tick(frame: f64, rate: u32, fmt: TimeFormat, step_secs: f64) -> St
             }
         }
         TimeFormat::Smpte => format_smpte(frame, rate),
+        TimeFormat::BarsBeats {
+            bpm_x100,
+            beats_per_bar,
+        } => {
+            let (beat, bpb) = beat_grid(rate, bpm_x100, beats_per_bar);
+            let beats = (frame / beat).round() as u64;
+            let (bar, in_bar) = (beats / bpb as u64 + 1, beats % bpb as u64 + 1);
+            if step_secs * rate as f64 >= beat * bpb as f64 - 0.5 {
+                format!("{bar}")
+            } else {
+                format!("{bar}:{in_bar}")
+            }
+        }
     }
 }
 
@@ -296,7 +357,67 @@ pub fn format_position(frame: f64, rate: u32, fmt: TimeFormat) -> String {
         TimeFormat::Decimal => format!("{:.3}", frame / rate as f64),
         TimeFormat::Samples => format!("{}", frame.round().max(0.0) as u64),
         TimeFormat::Smpte => format_smpte(frame, rate),
+        TimeFormat::BarsBeats {
+            bpm_x100,
+            beats_per_bar,
+        } => {
+            let (beat, bpb) = beat_grid(rate, bpm_x100, beats_per_bar);
+            let beats = (frame / beat).max(0.0);
+            let bar = (beats / bpb as f64).floor();
+            format!("{}:{:.2}", bar as u64 + 1, beats - bar * bpb as f64 + 1.0)
+        }
     }
+}
+
+/// Parse text typed in `fmt` back to a frame position. Inverse of [`format_position`].
+pub fn parse_position(text: &str, rate: u32, fmt: TimeFormat) -> Option<f64> {
+    let t = text.trim();
+    let num = |s: &str| {
+        s.trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    };
+    let rate_f = rate as f64;
+    let frames = match fmt {
+        TimeFormat::Samples => num(t)?,
+        TimeFormat::Decimal => num(t)? * rate_f,
+        TimeFormat::Time => {
+            let parts: Vec<&str> = t.split(':').collect();
+            if parts.len() > 3 {
+                return None;
+            }
+            let mut secs = 0.0;
+            for p in &parts {
+                secs = secs * 60.0 + num(p)?;
+            }
+            secs * rate_f
+        }
+        TimeFormat::Smpte => {
+            let parts: Vec<f64> = t.split(':').map(num).collect::<Option<_>>()?;
+            if parts.is_empty() || parts.len() > 4 {
+                return None;
+            }
+            let (ff, rest) = parts.split_last()?;
+            let secs = rest.iter().fold(0.0, |acc, v| acc * 60.0 + v);
+            (secs + ff / SMPTE_FPS) * rate_f
+        }
+        TimeFormat::BarsBeats {
+            bpm_x100,
+            beats_per_bar,
+        } => {
+            let (beat, bpb) = beat_grid(rate, bpm_x100, beats_per_bar);
+            let (bar, in_bar) = match t.split_once(':') {
+                Some((b, x)) => (num(b)?, num(x)?),
+                None => (num(t)?, 1.0),
+            };
+            if bar < 1.0 || in_bar < 1.0 {
+                return None;
+            }
+            ((bar - 1.0) * bpb as f64 + (in_bar - 1.0)) * beat
+        }
+    };
+    Some(frames)
 }
 
 pub fn format_smpte(frame: f64, rate: u32) -> String {
@@ -373,6 +494,64 @@ mod tests {
             format_position(24_000.0, 48_000, TimeFormat::Decimal),
             "0.500"
         );
+    }
+
+    #[test]
+    fn parse_inverts_format() {
+        let rate = 48_000;
+        let frame = 48_000.0 * 75.5; // 1:15.500
+        for fmt in TimeFormat::ALL {
+            let text = format_position(frame, rate, fmt);
+            let back = parse_position(&text, rate, fmt)
+                .unwrap_or_else(|| panic!("{fmt:?} could not parse {text}"));
+            assert!(
+                (back - frame).abs() <= rate as f64 / SMPTE_FPS,
+                "{fmt:?}: {text} -> {back}"
+            );
+        }
+        assert_eq!(
+            parse_position("2:00", rate, TimeFormat::Time),
+            Some(120.0 * 48_000.0)
+        );
+        assert_eq!(
+            parse_position("1:00:00.5", rate, TimeFormat::Time),
+            Some(3600.5 * 48_000.0)
+        );
+        assert_eq!(
+            parse_position("3:2", rate, TimeFormat::bars_beats(120.0, 4)),
+            Some(9.0 * 24_000.0)
+        );
+        for bad in ["", "abc", "-1", "1:2:3:4"] {
+            assert_eq!(parse_position(bad, rate, TimeFormat::Time), None, "{bad:?}");
+        }
+        assert_eq!(
+            parse_position("0:1", rate, TimeFormat::bars_beats(120.0, 4)),
+            None,
+            "bars start at 1"
+        );
+    }
+
+    #[test]
+    fn bar_ticks_land_on_bars_and_beats() {
+        let fmt = TimeFormat::bars_beats(120.0, 4); // beat = 24000 frames at 48 kHz
+        let zoomed_in = View {
+            start: 0.0,
+            frames_per_px: 100.0,
+            amp: 1.0,
+        };
+        let t = time_ticks(&zoomed_in, 1000.0, 48_000, fmt, 90.0);
+        let majors: Vec<&Tick> = t.iter().filter(|x| x.major).collect();
+        assert_eq!(majors[1].frame, 24_000.0);
+        assert_eq!(majors[1].label.as_deref(), Some("1:2"));
+        let zoomed_out = View {
+            start: 0.0,
+            frames_per_px: 2000.0,
+            amp: 1.0,
+        };
+        let t = time_ticks(&zoomed_out, 1000.0, 48_000, fmt, 90.0);
+        let majors: Vec<&Tick> = t.iter().filter(|x| x.major).collect();
+        assert_eq!(majors[1].frame % 96_000.0, 0.0, "majors on bar lines");
+        assert!(majors[1].label.as_deref().is_some_and(|l| !l.contains(':')));
     }
 
     #[test]

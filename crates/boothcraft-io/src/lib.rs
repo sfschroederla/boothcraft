@@ -6,9 +6,11 @@ use std::path::Path;
 mod aiff;
 mod decode;
 mod encode;
+mod riff;
 
 pub use decode::read;
 pub use encode::{write, BitDepth, Format, WriteOptions};
+pub use riff::{append_markers, read_markers};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -37,6 +39,6 @@ pub fn convert(src: &Path, dst: &Path, depth: BitDepth) -> Result<Document> {
     let doc = read(src)?;
     let format =
         format_for_path(dst).ok_or_else(|| Error::Encode("unknown output extension".into()))?;
-    write(&doc, dst, &WriteOptions { format, depth })?;
+    write(&doc, dst, &WriteOptions::new(format, depth))?;
     Ok(doc)
 }

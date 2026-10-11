@@ -1,11 +1,13 @@
 use crate::ops::OpenFile;
 use crate::scale::{self, AmpUnits, TimeFormat};
-use crate::view::{edge_drag_anchor, extend_anchor, View};
-use boothcraft_core::Selection;
+use crate::view::{self, edge_drag_anchor, extend_anchor, View};
+use boothcraft_core::{fade_gain, FadeShape, Selection, ZeroDir};
 use egui::{pos2, vec2, Color32, CursorIcon, Pos2, Rect, Sense, Shape, Stroke, Ui};
 
 const OVERVIEW_H: f32 = 44.0;
-const RULER_H: f32 = 22.0;
+const RULER_H: f32 = 34.0;
+/// Height of the marker band at the top of the ruler.
+const MARKER_BAND_H: f32 = 12.0;
 /// Width of the amplitude scale column to the right of the lanes.
 const SCALE_W: f32 = 44.0;
 /// Width of the L/R channel button column at the far right.
@@ -24,12 +26,106 @@ const PLAYHEAD: Color32 = Color32::from_rgb(90, 150, 255);
 const SELECTION: Color32 = Color32::from_rgba_premultiplied(60, 100, 160, 90);
 const SELECTION_EDGE: Color32 = Color32::from_rgb(130, 170, 240);
 const PANEL_BG: Color32 = Color32::from_rgb(34, 34, 34);
+const CUE_MARKER: Color32 = Color32::from_rgb(235, 235, 235);
+const RANGE_MARKER: Color32 = Color32::from_rgb(190, 150, 255);
 
 /// Display preferences shared by every open file.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct DisplayOptions {
     pub amp: AmpUnits,
     pub time: TimeFormat,
+    pub snap: SnapOptions,
+    pub tempo_bpm: f32,
+    pub beats_per_bar: u32,
+}
+
+impl Default for DisplayOptions {
+    fn default() -> Self {
+        DisplayOptions {
+            amp: AmpUnits::default(),
+            time: TimeFormat::default(),
+            snap: SnapOptions::default(),
+            tempo_bpm: 120.0,
+            beats_per_bar: 4,
+        }
+    }
+}
+
+/// What selection and marker drags snap to (Edit > Snapping).
+#[derive(Clone, Copy, Debug)]
+pub struct SnapOptions {
+    pub enabled: bool,
+    pub markers: bool,
+    pub ruler: bool,
+    pub zero_crossings: bool,
+}
+
+impl Default for SnapOptions {
+    fn default() -> Self {
+        SnapOptions {
+            enabled: true,
+            markers: true,
+            ruler: false,
+            zero_crossings: false,
+        }
+    }
+}
+
+/// Snap distance in pixels.
+const SNAP_PX: f32 = 8.0;
+
+/// Converts pointer positions to frames, applying the active snapping rules.
+struct Snapper {
+    candidates: Vec<f64>,
+    zero_crossings: bool,
+    left: f32,
+    total: usize,
+}
+
+impl Snapper {
+    /// `exclude` leaves one marker out, so a marker being dragged does not snap to itself.
+    fn new(
+        file: &OpenFile,
+        opts: &DisplayOptions,
+        ticks: &[scale::Tick],
+        left: f32,
+        exclude: Option<usize>,
+    ) -> Snapper {
+        let snap = opts.snap;
+        let mut candidates = Vec::new();
+        if snap.enabled && snap.markers {
+            for (i, m) in file.doc().markers.iter().enumerate() {
+                if Some(i) != exclude {
+                    candidates.push(m.at as f64);
+                    candidates.push(m.end() as f64);
+                }
+            }
+        }
+        if snap.enabled && snap.ruler {
+            candidates.extend(ticks.iter().map(|t| t.frame));
+        }
+        Snapper {
+            candidates,
+            zero_crossings: snap.enabled && snap.zero_crossings,
+            left,
+            total: file.doc().frames(),
+        }
+    }
+
+    fn frame(&self, file: &OpenFile, x: f32) -> usize {
+        let v = &file.view;
+        let raw = v.px_to_frame(x - self.left).max(0.0).min(self.total as f64);
+        let tol = SNAP_PX as f64 * v.frames_per_px;
+        let snapped = view::snap(raw, &self.candidates, tol);
+        let f = (snapped.round() as usize).min(self.total);
+        if snapped == raw && self.zero_crossings {
+            return file
+                .doc()
+                .zero_crossing(f, ZeroDir::Nearest, file.mask, tol.ceil() as usize)
+                .unwrap_or(f);
+        }
+        f
+    }
 }
 
 /// Zoom actions requested from the transport bar.
@@ -48,6 +144,8 @@ pub enum ZoomCmd {
 pub struct WaveformEvents {
     /// Set when the user clicked to a new cursor position (frames).
     pub seek: Option<usize>,
+    /// Gain in dB being previewed with the HUD knob (while dragging), applied to playback.
+    pub preview_gain_db: Option<f32>,
 }
 
 fn apply_zoom(file: &mut OpenFile, cmd: ZoomCmd, total: usize, width: f32) {
@@ -121,10 +219,17 @@ pub fn show(
     );
 
     let resp = ui.interact(lanes, ui.id().with("lanes"), Sense::click_and_drag());
+    let input_ticks = scale::time_ticks(&file.view, width, rate, opts.time, LABEL_PX);
     handle_ruler_menu(ui, ruler, opts);
+    let marker_drag = handle_markers(ui, ruler, file, opts, &input_ticks, &mut events);
     handle_strip(ui, strip, file, opts);
     handle_channel_buttons(ui, chan_col, file);
-    handle_input(ui, &resp, file, lanes, total, &mut events);
+    let snapper = Snapper::new(file, opts, &input_ticks, lanes.left(), None);
+    handle_input(ui, &resp, file, lanes, total, &snapper, &mut events);
+    // Registered after the lanes so they sit on top of them for hit-testing.
+    let fade_drag = handle_fades(ui, lanes, file);
+    let hud_db = handle_hud(ui, lanes, file);
+    events.preview_gain_db = (hud_db != 0.0).then_some(hud_db);
     if follow {
         file.view.reveal(playhead, total, width);
     }
@@ -133,7 +238,15 @@ pub fn show(
     let painter = ui.painter_at(outer);
     painter.rect_filled(lanes, 0.0, BACKGROUND);
     let ticks = scale::time_ticks(&view, width, rate, opts.time, LABEL_PX);
-    draw_lanes(&painter, lanes, file, &view, opts, &ticks);
+    draw_lanes(
+        &painter,
+        lanes,
+        file,
+        &view,
+        opts,
+        &ticks,
+        10f32.powf(hud_db / 20.0),
+    );
     draw_strip(&painter, strip, file, &view, opts);
     draw_channel_buttons(&painter, chan_col, file);
     draw_ruler(&painter, ruler, &view, &ticks, opts);
@@ -145,6 +258,7 @@ pub fn show(
         Color32::LIGHT_GRAY,
     );
     draw_selection(&painter, lanes, file.selection, &view);
+    draw_markers(&painter, ruler, lanes, file, &view, marker_drag);
     let x = lanes.left() + view.frame_to_px(playhead);
     if x >= lanes.left() && x <= lanes.right() {
         painter.line_segment(
@@ -168,8 +282,355 @@ pub fn show(
             Stroke::new(1.0, Color32::from_white_alpha(120)),
         );
     }
+    draw_fades(&painter, lanes, file, &view, fade_drag);
+    draw_hud(&painter, lanes, hud_db);
     draw_overview(ui, &painter, overview, file, playhead);
     events
+}
+
+enum MarkerAction {
+    Move(usize, usize),
+    Select(usize),
+    Delete(usize),
+}
+
+fn marker_flag_rect(ruler: Rect, x: f32) -> Rect {
+    Rect::from_min_size(
+        pos2(x - 1.0, ruler.top() + 1.0),
+        vec2(8.0, MARKER_BAND_H - 2.0),
+    )
+}
+
+/// Marker flags: click to jump (ranges select their span), drag to move, right-click to delete.
+/// Returns the marker being dragged and its provisional position, for drawing.
+fn handle_markers(
+    ui: &Ui,
+    ruler: Rect,
+    file: &mut OpenFile,
+    opts: &DisplayOptions,
+    ticks: &[scale::Tick],
+    ev: &mut WaveformEvents,
+) -> Option<(usize, usize)> {
+    let drag_id = ui.id().with("marker_drag");
+    let view = file.view;
+    let mut action = None;
+    for (i, m) in file.doc().markers.iter().enumerate() {
+        let x = ruler.left() + view.frame_to_px(m.at as f64);
+        if x < ruler.left() - 8.0 || x > ruler.right() + 8.0 {
+            continue;
+        }
+        let resp = ui.interact(
+            marker_flag_rect(ruler, x).expand(3.0),
+            ui.id().with(("marker", i)),
+            Sense::click_and_drag(),
+        );
+        if resp.dragged() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            if let Some(p) = resp.interact_pointer_pos() {
+                let f = Snapper::new(file, opts, ticks, ruler.left(), Some(i)).frame(file, p.x);
+                ui.data_mut(|d| d.insert_temp(drag_id, (i, f)));
+            }
+        } else if resp.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
+        }
+        if resp.drag_stopped() {
+            if let Some((j, f)) = ui.data(|d| d.get_temp::<(usize, usize)>(drag_id)) {
+                action = Some(MarkerAction::Move(j, f));
+            }
+            ui.data_mut(|d| d.remove::<(usize, usize)>(drag_id));
+        } else if resp.clicked() {
+            action = Some(MarkerAction::Select(i));
+        }
+        resp.context_menu(|ui| {
+            if ui.button("Delete marker").clicked() {
+                action = Some(MarkerAction::Delete(i));
+                ui.close();
+            }
+        });
+        resp.on_hover_text(&m.name);
+    }
+    // Apply after the loop: every marker edit can reorder the list.
+    match action {
+        Some(MarkerAction::Move(i, f)) => file.move_marker(i, f),
+        Some(MarkerAction::Select(i)) => ev.seek = file.select_marker(i),
+        Some(MarkerAction::Delete(i)) => file.remove_marker(i),
+        None => {}
+    }
+    ui.data(|d| d.get_temp::<(usize, usize)>(drag_id))
+}
+
+fn dashed_vline(p: &egui::Painter, x: f32, top: f32, bottom: f32, color: Color32) {
+    let mut y = top;
+    while y < bottom {
+        p.line_segment(
+            [pos2(x, y), pos2(x, (y + 4.0).min(bottom))],
+            Stroke::new(1.0, color),
+        );
+        y += 8.0;
+    }
+}
+
+fn draw_markers(
+    p: &egui::Painter,
+    ruler: Rect,
+    lanes: Rect,
+    file: &OpenFile,
+    v: &View,
+    drag: Option<(usize, usize)>,
+) {
+    let font = egui::FontId::proportional(9.5);
+    for (i, m) in file.doc().markers.iter().enumerate() {
+        let at = match drag {
+            Some((j, f)) if j == i => f,
+            _ => m.at,
+        };
+        let len = m.end() - m.at;
+        let color = if m.is_range() {
+            RANGE_MARKER
+        } else {
+            CUE_MARKER
+        };
+        let x = lanes.left() + v.frame_to_px(at as f64);
+        let x2 = lanes.left() + v.frame_to_px((at + len) as f64);
+        if x2 < lanes.left() - 8.0 || x > lanes.right() + 8.0 {
+            continue;
+        }
+        if m.is_range() {
+            let band = |top: f32, bottom: f32| {
+                Rect::from_min_max(
+                    pos2(x.max(lanes.left()), top),
+                    pos2(x2.min(lanes.right()), bottom),
+                )
+            };
+            p.rect_filled(
+                band(lanes.top(), lanes.bottom()),
+                0.0,
+                color.gamma_multiply(0.08),
+            );
+            p.rect_filled(
+                band(ruler.top(), ruler.top() + MARKER_BAND_H),
+                0.0,
+                color.gamma_multiply(0.3),
+            );
+            dashed_vline(
+                p,
+                x2,
+                lanes.top(),
+                lanes.bottom(),
+                color.gamma_multiply(0.6),
+            );
+        }
+        dashed_vline(p, x, lanes.top(), lanes.bottom(), color.gamma_multiply(0.6));
+        p.line_segment(
+            [pos2(x, ruler.top()), pos2(x, ruler.bottom())],
+            Stroke::new(1.0, color),
+        );
+        p.rect_filled(marker_flag_rect(ruler, x), 1.0, color);
+        p.text(
+            pos2(x + 9.0, ruler.top() + MARKER_BAND_H / 2.0),
+            egui::Align2::LEFT_CENTER,
+            &m.name,
+            font.clone(),
+            color,
+        );
+    }
+}
+
+const FADE_HANDLE: f32 = 10.0;
+const FADE_COLOR: Color32 = Color32::from_rgb(250, 210, 90);
+
+/// A fade being dragged: which end, its length in frames, and its shape.
+#[derive(Clone, Copy, Debug)]
+struct FadeDrag {
+    fade_in: bool,
+    len: usize,
+    shape: FadeShape,
+}
+
+fn fade_handle_rect(lanes: Rect, x: f32) -> Rect {
+    let x = x.clamp(
+        lanes.left() + FADE_HANDLE / 2.0 + 1.0,
+        lanes.right() - FADE_HANDLE / 2.0 - 1.0,
+    );
+    Rect::from_center_size(
+        pos2(x, lanes.top() + FADE_HANDLE / 2.0 + 3.0),
+        vec2(FADE_HANDLE, FADE_HANDLE),
+    )
+}
+
+/// The fade-in and fade-out handles sit at the file's start and end. Drag horizontally for length,
+/// vertically for curve (up: logarithmic, down: exponential), hold Cmd/Ctrl for a cosine curve.
+/// The fade is applied when the drag ends.
+fn handle_fades(ui: &Ui, lanes: Rect, file: &mut OpenFile) -> Option<FadeDrag> {
+    let drag_id = ui.id().with("fade_drag");
+    let total = file.doc().frames();
+    let v = file.view;
+    let current: Option<FadeDrag> = ui.data(|d| d.get_temp(drag_id));
+    for fade_in in [true, false] {
+        let len = current
+            .filter(|d| d.fade_in == fade_in)
+            .map_or(0, |d| d.len);
+        let frame = if fade_in { len } else { total - len.min(total) };
+        let x = lanes.left() + v.frame_to_px(frame as f64);
+        if x < lanes.left() - FADE_HANDLE || x > lanes.right() + FADE_HANDLE {
+            continue;
+        }
+        let resp = ui.interact(
+            fade_handle_rect(lanes, x),
+            ui.id().with(("fade", fade_in)),
+            Sense::drag(),
+        );
+        if resp.hovered() || resp.dragged() {
+            ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+        }
+        if resp.dragged() {
+            if let (Some(p), Some(origin)) = (
+                resp.interact_pointer_pos(),
+                ui.input(|i| i.pointer.press_origin()),
+            ) {
+                let f = (v.px_to_frame(p.x - lanes.left()).round().max(0.0) as usize).min(total);
+                let len = if fade_in { f } else { total - f };
+                let c = ((origin.y - p.y) / (lanes.height() / 2.0)).clamp(-1.0, 1.0);
+                let shape = if ui.input(|i| i.modifiers.command) {
+                    FadeShape::Cosine
+                } else {
+                    FadeShape::Power(c)
+                };
+                ui.data_mut(|d| {
+                    d.insert_temp(
+                        drag_id,
+                        FadeDrag {
+                            fade_in,
+                            len,
+                            shape,
+                        },
+                    )
+                });
+            }
+        }
+        if resp.drag_stopped() {
+            if let Some(d) = ui.data(|d| d.get_temp::<FadeDrag>(drag_id)) {
+                file.fade(d.fade_in, d.len, d.shape);
+            }
+            ui.data_mut(|d| d.remove::<FadeDrag>(drag_id));
+        }
+        resp.on_hover_text(if fade_in {
+            "Fade In: drag right for length, up/down for curve, Cmd for cosine"
+        } else {
+            "Fade Out: drag left for length, up/down for curve, Cmd for cosine"
+        });
+    }
+    ui.data(|d| d.get_temp(drag_id))
+}
+
+fn draw_fades(p: &egui::Painter, lanes: Rect, file: &OpenFile, v: &View, drag: Option<FadeDrag>) {
+    let total = file.doc().frames();
+    if let Some(d) = drag.filter(|d| d.len > 0) {
+        let (from, to) = if d.fade_in {
+            (0, d.len)
+        } else {
+            (total - d.len, total)
+        };
+        let (x0, x1) = (
+            lanes.left() + v.frame_to_px(from as f64),
+            lanes.left() + v.frame_to_px(to as f64),
+        );
+        let steps = ((x1 - x0).abs() as usize).clamp(2, 400);
+        let pts: Vec<Pos2> = (0..=steps)
+            .map(|k| {
+                let t = k as f32 / steps as f32;
+                let g = fade_gain(if d.fade_in { t } else { 1.0 - t }, d.shape);
+                pos2(x0 + (x1 - x0) * t, lanes.bottom() - g * lanes.height())
+            })
+            .collect();
+        let clipped = p.with_clip_rect(lanes);
+        clipped.add(Shape::line(pts, Stroke::new(1.5, FADE_COLOR)));
+    }
+    for fade_in in [true, false] {
+        let len = drag.filter(|d| d.fade_in == fade_in).map_or(0, |d| d.len);
+        let frame = if fade_in { len } else { total - len.min(total) };
+        let x = lanes.left() + v.frame_to_px(frame as f64);
+        if x < lanes.left() - FADE_HANDLE || x > lanes.right() + FADE_HANDLE {
+            continue;
+        }
+        let r = fade_handle_rect(lanes, x);
+        p.rect_filled(r, 1.0, Color32::from_gray(70));
+        p.rect_stroke(
+            r,
+            1.0,
+            Stroke::new(1.0, Color32::from_gray(200)),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
+const HUD_RANGE_DB: f32 = 40.0;
+
+fn hud_rect(lanes: Rect) -> Rect {
+    Rect::from_min_size(lanes.left_top() + vec2(14.0, 24.0), vec2(96.0, 24.0))
+}
+
+/// The floating gain knob: drag (right/up raises) to preview, release to apply Amplify.
+/// Returns the gain in dB currently being previewed (0 when idle).
+fn handle_hud(ui: &Ui, lanes: Rect, file: &mut OpenFile) -> f32 {
+    let id = ui.id().with("hud_db");
+    let knob = Rect::from_center_size(
+        pos2(hud_rect(lanes).left() + 14.0, hud_rect(lanes).center().y),
+        vec2(20.0, 20.0),
+    );
+    let resp = ui.interact(knob, ui.id().with("hud_knob"), Sense::drag());
+    let mut db: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.0);
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+    }
+    if resp.dragged() {
+        let d = resp.drag_delta();
+        db = (db + (d.x - d.y) * 0.1).clamp(-HUD_RANGE_DB, HUD_RANGE_DB);
+        ui.data_mut(|m| m.insert_temp(id, db));
+    }
+    if resp.drag_stopped() {
+        let rounded = (db * 10.0).round() / 10.0;
+        if rounded != 0.0 {
+            file.amplify(rounded);
+        }
+        db = 0.0;
+        ui.data_mut(|m| m.remove::<f32>(id));
+    }
+    resp.on_hover_text(
+        "Adjust amplitude: drag to preview, release to apply to the selection (or whole file)",
+    );
+    db
+}
+
+fn draw_hud(p: &egui::Painter, lanes: Rect, db: f32) {
+    let r = hud_rect(lanes);
+    p.rect_filled(r, 4.0, Color32::from_black_alpha(170));
+    p.rect_stroke(
+        r,
+        4.0,
+        Stroke::new(1.0, Color32::from_gray(80)),
+        egui::StrokeKind::Inside,
+    );
+    let c = pos2(r.left() + 14.0, r.center().y);
+    p.circle_stroke(c, 8.0, Stroke::new(1.5, Color32::from_gray(200)));
+    // -40 dB points to 7 o'clock, +40 dB to 5 o'clock.
+    let angle = (db / HUD_RANGE_DB) * 135f32.to_radians() - std::f32::consts::FRAC_PI_2;
+    p.line_segment(
+        [c, c + vec2(angle.cos(), angle.sin()) * 7.0],
+        Stroke::new(1.5, Color32::WHITE),
+    );
+    let color = if db == 0.0 {
+        Color32::from_rgb(140, 170, 230)
+    } else {
+        FADE_COLOR
+    };
+    p.text(
+        pos2(r.left() + 28.0, r.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{db:+.1} dB"),
+        egui::FontId::proportional(11.0),
+        color,
+    );
 }
 
 /// Right-clicking the ruler picks the time format.
@@ -177,8 +638,39 @@ fn handle_ruler_menu(ui: &Ui, ruler: Rect, opts: &mut DisplayOptions) {
     let resp = ui.interact(ruler, ui.id().with("ruler"), Sense::click());
     resp.context_menu(|ui| {
         for f in TimeFormat::ALL {
-            if ui.radio_value(&mut opts.time, f, f.name()).clicked() {
+            if ui.radio(opts.time.same_kind(f), f.name()).clicked() {
+                opts.time = match f {
+                    TimeFormat::BarsBeats { .. } => {
+                        TimeFormat::bars_beats(opts.tempo_bpm, opts.beats_per_bar)
+                    }
+                    other => other,
+                };
                 ui.close();
+            }
+        }
+        if let TimeFormat::BarsBeats { .. } = opts.time {
+            ui.separator();
+            let tempo = ui
+                .horizontal(|ui| {
+                    ui.label("Tempo");
+                    ui.add(
+                        egui::DragValue::new(&mut opts.tempo_bpm)
+                            .range(20.0..=300.0)
+                            .speed(0.5)
+                            .suffix(" BPM"),
+                    )
+                    .changed()
+                })
+                .inner;
+            let beats = ui
+                .horizontal(|ui| {
+                    ui.label("Beats per bar");
+                    ui.add(egui::DragValue::new(&mut opts.beats_per_bar).range(1..=16))
+                        .changed()
+                })
+                .inner;
+            if tempo || beats {
+                opts.time = TimeFormat::bars_beats(opts.tempo_bpm, opts.beats_per_bar);
             }
         }
     });
@@ -259,11 +751,11 @@ fn handle_input(
     file: &mut OpenFile,
     lanes: Rect,
     total: usize,
+    snapper: &Snapper,
     ev: &mut WaveformEvents,
 ) {
     let width = lanes.width();
-    let frame_at =
-        |x: f32, v: &View| (v.px_to_frame(x - lanes.left()).round().max(0.0) as usize).min(total);
+    let frame_at = |x: f32, file: &OpenFile| snapper.frame(file, x);
     let shift = ui.input(|i| i.modifiers.shift);
 
     if let Some(p) = resp.hover_pos() {
@@ -275,7 +767,7 @@ fn handle_input(
     if resp.drag_started() {
         // The pointer has already moved past the drag threshold; the press origin is where the user aimed.
         if let Some(p) = ui.input(|i| i.pointer.press_origin()) {
-            let f = frame_at(p.x, &file.view);
+            let f = frame_at(p.x, file);
             let anchor = if shift {
                 extend_anchor(file.selection, f)
             } else {
@@ -291,12 +783,12 @@ fn handle_input(
             resp.interact_pointer_pos(),
             ui.data(|d| d.get_temp::<usize>(resp.id)),
         ) {
-            file.selection = Selection::new(anchor, frame_at(p.x, &file.view));
+            file.selection = Selection::new(anchor, frame_at(p.x, file));
         }
     }
     if resp.clicked() {
         if let Some(p) = resp.interact_pointer_pos() {
-            let f = frame_at(p.x, &file.view);
+            let f = frame_at(p.x, file);
             if shift {
                 file.selection = Selection::new(extend_anchor(file.selection, f), f);
             } else {
@@ -377,7 +869,7 @@ fn draw_ruler(
         if let Some(label) = &t.label {
             if x - rect.left() >= CORNER_PX {
                 p.text(
-                    pos2(x + 3.0, rect.top() + 3.0),
+                    pos2(x + 3.0, rect.top() + MARKER_BAND_H + 2.0),
                     egui::Align2::LEFT_TOP,
                     label,
                     egui::FontId::proportional(10.0),
@@ -387,7 +879,7 @@ fn draw_ruler(
         }
     }
     p.text(
-        pos2(rect.left() + 3.0, rect.top() + 3.0),
+        pos2(rect.left() + 3.0, rect.top() + MARKER_BAND_H + 2.0),
         egui::Align2::LEFT_TOP,
         opts.time.short(),
         egui::FontId::proportional(10.0),
@@ -458,6 +950,7 @@ fn draw_lanes(
     v: &View,
     opts: &DisplayOptions,
     ticks: &[scale::Tick],
+    preview_gain: f32,
 ) {
     let doc = file.doc();
     let n = doc.channel_count();
@@ -481,7 +974,7 @@ fn draw_lanes(
         let p = p.with_clip_rect(lane);
         let mid = lane.center().y;
         let half = lane.height() * 0.5 - 2.0;
-        let scale = half * v.amp;
+        let scale = half * v.amp * preview_gain;
         let dim = if file.mask.has(c) { 1.0 } else { 0.35 };
         for g in scale::amp_gridlines(opts.amp, v.amp, half, 18.0) {
             for y in [mid - g.value * scale, mid + g.value * scale] {

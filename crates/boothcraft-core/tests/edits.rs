@@ -119,3 +119,118 @@ proptest! {
         prop_assert_eq!(all(h.current()), before);
     }
 }
+
+#[test]
+fn markers_stay_sorted_and_clamped() {
+    let mut d = doc(1000);
+    assert_eq!(d.add_marker(Marker::cue(d.next_marker_name(), 500)), 0);
+    assert_eq!(d.add_marker(Marker::cue(d.next_marker_name(), 100)), 0);
+    assert_eq!(d.add_marker(Marker::range("r", 900, 500)), 2);
+    assert_eq!(
+        d.markers[2].kind,
+        MarkerKind::Range { len: 100 },
+        "range clamped to file end"
+    );
+    assert_eq!(d.markers[1].name, "Marker 01");
+    assert_eq!(d.next_marker_name(), "Marker 03");
+    let i = d.move_marker(0, 950).unwrap();
+    assert_eq!(i, 2);
+    assert!(d.markers.windows(2).all(|w| w[0].at <= w[1].at));
+    assert_eq!(d.marker_after(500), Some(1));
+    assert_eq!(d.marker_before(500), None);
+    assert_eq!(d.marker_before(901), Some(1));
+    d.rename_marker(0, "Intro");
+    assert_eq!(d.markers[0].name, "Intro");
+    assert!(d.remove_marker(5).is_none());
+    assert_eq!(d.remove_marker(0).unwrap().name, "Intro");
+}
+
+#[test]
+fn zero_crossings_of_a_sine() {
+    // Period 100 frames: crossings at 0, 50, 100, ...
+    let v: Vec<f32> = (0..1000)
+        .map(|i| (i as f32 * std::f32::consts::TAU / 100.0).sin())
+        .collect();
+    let d = Document::new(48_000, vec![Rope::from_samples(&v)]);
+    let all = ChannelMask::ALL;
+    assert_eq!(d.zero_crossing(120, ZeroDir::Left, all, 1000), Some(100));
+    assert_eq!(d.zero_crossing(120, ZeroDir::Right, all, 1000), Some(150));
+    assert_eq!(d.zero_crossing(140, ZeroDir::Nearest, all, 1000), Some(150));
+    assert_eq!(
+        d.zero_crossing(120, ZeroDir::Right, all, 10),
+        None,
+        "search window respected"
+    );
+}
+
+#[test]
+fn zero_crossings_use_enabled_channels_only() {
+    let pos = vec![0.5f32; 100];
+    let mut flip = vec![0.5f32; 100];
+    flip[60..].fill(-0.5);
+    let d = Document::new(
+        48_000,
+        vec![Rope::from_samples(&pos), Rope::from_samples(&flip)],
+    );
+    assert_eq!(
+        d.zero_crossing(10, ZeroDir::Right, ChannelMask(0b01), 100),
+        None
+    );
+    assert_eq!(
+        d.zero_crossing(10, ZeroDir::Right, ChannelMask(0b10), 100),
+        Some(59)
+    );
+    // Summed, the second half is exactly zero, which counts as a crossing.
+    assert_eq!(
+        d.zero_crossing(10, ZeroDir::Right, ChannelMask::ALL, 100),
+        Some(60)
+    );
+}
+
+#[test]
+fn fades_touch_only_their_ends() {
+    let mut d = Document::new(48_000, vec![Rope::from_samples(&vec![1.0; 1000])]);
+    d.fade_in(100, FadeShape::Power(0.0), ChannelMask::ALL);
+    d.fade_out(200, FadeShape::Cosine, ChannelMask::ALL);
+    let v = d.channels[0].to_vec(0..1000);
+    assert_eq!(v[0], 0.0);
+    assert!((v[50] - 0.5).abs() < 1e-6);
+    assert_eq!(v[100..800], vec![1.0; 700][..]);
+    assert!(v[999] < 0.001, "ends at silence, got {}", v[999]);
+    assert!(v[800] > 0.99);
+}
+
+#[test]
+fn small_appends_coalesce_into_full_blocks() {
+    let mut r = Rope::new();
+    for _ in 0..1000 {
+        r.push_samples(&[0.5; 700]);
+    }
+    assert_eq!(r.len(), 700_000);
+    assert!(
+        r.blocks().len() <= 700_000 / BLOCK_FRAMES + 1,
+        "{} blocks",
+        r.blocks().len()
+    );
+    assert!(r.blocks()[..r.blocks().len() - 1]
+        .iter()
+        .all(|b| b.len() == BLOCK_FRAMES));
+}
+
+#[test]
+fn overwrite_replaces_and_extends() {
+    let mut d = doc(100);
+    let new = vec![-1.0f32; 30];
+    d.overwrite(80, &[&new, &new]);
+    assert_eq!(d.frames(), 110);
+    let v = d.channels[1].to_vec(0..110);
+    assert_eq!(v[79], 79.0);
+    assert!(v[80..110].iter().all(|&x| x == -1.0));
+    d.overwrite(10, &[&new[..5]]);
+    assert_eq!(d.frames(), 110, "inside the file: no extension");
+    assert_eq!(
+        d.channels[1].to_vec(10..16),
+        vec![-1.0, -1.0, -1.0, -1.0, -1.0, 15.0],
+        "mono source fills every channel"
+    );
+}

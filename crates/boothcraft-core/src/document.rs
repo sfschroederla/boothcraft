@@ -220,8 +220,165 @@ impl Document {
         self.apply(range, mask, |_, s| s.reverse());
     }
 
+    /// Replace audio from `at` with `chans` (one slice per channel, equal lengths), extending the file
+    /// if the new audio runs past the end. Used for recording over existing audio.
+    pub fn overwrite(&mut self, at: usize, chans: &[&[f32]]) {
+        let n = chans.first().map_or(0, |c| c.len());
+        let at = at.min(self.frames());
+        let overlap = n.min(self.frames() - at);
+        for (c, rope) in self.channels.iter_mut().enumerate() {
+            let src = chans.get(c).or(chans.first()).copied().unwrap_or(&[]);
+            rope.map_range(at..at + overlap, |dst| dst.copy_from_slice(&src[..overlap]));
+            rope.push_samples(&src[overlap..n]);
+        }
+    }
+
+    /// Fade the first `len` frames up from silence.
+    pub fn fade_in(&mut self, len: usize, shape: crate::FadeShape, mask: ChannelMask) {
+        let len = len.min(self.frames());
+        self.apply(0..len, mask, |_, s| {
+            for (i, x) in s.iter_mut().enumerate() {
+                *x *= crate::fade_gain(i as f32 / len as f32, shape);
+            }
+        });
+    }
+
+    /// Fade the last `len` frames down to silence.
+    pub fn fade_out(&mut self, len: usize, shape: crate::FadeShape, mask: ChannelMask) {
+        let n = self.frames();
+        let len = len.min(n);
+        self.apply(n - len..n, mask, |_, s| {
+            for (i, x) in s.iter_mut().enumerate() {
+                *x *= crate::fade_gain((len - 1 - i) as f32 / len as f32, shape);
+            }
+        });
+    }
+
     pub fn amplify(&mut self, range: Range<usize>, mask: ChannelMask, gain: f32) {
         self.apply(range, mask, |_, s| s.iter_mut().for_each(|x| *x *= gain));
+    }
+}
+
+/// Which way to search for a zero crossing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZeroDir {
+    Left,
+    Right,
+    Nearest,
+}
+
+impl Document {
+    /// The zero crossing of the summed enabled channels closest to `frame` in direction `dir`,
+    /// searching at most `max_frames` away. A crossing resolves to whichever of its two samples is
+    /// nearer zero; exact zeros count as crossings.
+    pub fn zero_crossing(
+        &self,
+        frame: usize,
+        dir: ZeroDir,
+        mask: ChannelMask,
+        max_frames: usize,
+    ) -> Option<usize> {
+        let n = self.frames();
+        if n < 2 {
+            return None;
+        }
+        let frame = frame.min(n - 1);
+        let lo = if dir == ZeroDir::Right {
+            frame
+        } else {
+            frame.saturating_sub(max_frames)
+        };
+        let hi = if dir == ZeroDir::Left {
+            frame
+        } else {
+            (frame + max_frames).min(n - 1)
+        };
+        let (a, b) = (lo.saturating_sub(1), (hi + 1).min(n));
+        let use_all = (0..self.channel_count()).all(|c| !mask.has(c));
+        let mut sum = vec![0f32; b - a];
+        for (c, rope) in self.channels.iter().enumerate() {
+            if use_all || mask.has(c) {
+                for (s, v) in sum.iter_mut().zip(rope.to_vec(a..b)) {
+                    *s += v;
+                }
+            }
+        }
+        let mut best: Option<usize> = None;
+        for i in a + 1..b {
+            let (x, y) = (sum[i - 1 - a], sum[i - a]);
+            let p = if y == 0.0 {
+                i
+            } else if (x < 0.0) != (y < 0.0) {
+                if x.abs() <= y.abs() {
+                    i - 1
+                } else {
+                    i
+                }
+            } else {
+                continue;
+            };
+            let ok = match dir {
+                ZeroDir::Left => p <= frame,
+                ZeroDir::Right => p >= frame,
+                ZeroDir::Nearest => true,
+            };
+            if ok && best.is_none_or(|b| p.abs_diff(frame) < b.abs_diff(frame)) {
+                best = Some(p);
+            }
+        }
+        best
+    }
+}
+
+/// Marker editing. Markers are kept sorted by position, so indices are stable only until the next
+/// marker edit; every method returns or takes the index in that sorted order.
+impl Document {
+    /// Insert a marker, clamped to the file, returning its index.
+    pub fn add_marker(&mut self, mut m: Marker) -> usize {
+        let frames = self.frames();
+        m.at = m.at.min(frames);
+        if let MarkerKind::Range { len } = &mut m.kind {
+            *len = (*len).min(frames - m.at);
+        }
+        let i = self.markers.partition_point(|x| x.at <= m.at);
+        self.markers.insert(i, m);
+        i
+    }
+
+    pub fn remove_marker(&mut self, i: usize) -> Option<Marker> {
+        (i < self.markers.len()).then(|| self.markers.remove(i))
+    }
+
+    pub fn rename_marker(&mut self, i: usize, name: impl Into<String>) {
+        if let Some(m) = self.markers.get_mut(i) {
+            m.name = name.into();
+        }
+    }
+
+    /// Move marker `i` so it starts at `at` (ranges keep their length), returning its new index.
+    pub fn move_marker(&mut self, i: usize, at: usize) -> Option<usize> {
+        let m = self.remove_marker(i)?;
+        Some(self.add_marker(Marker { at, ..m }))
+    }
+
+    /// The next default name, "Marker 01", "Marker 02", …
+    pub fn next_marker_name(&self) -> String {
+        let n = self
+            .markers
+            .iter()
+            .filter_map(|m| m.name.strip_prefix("Marker ")?.parse::<u32>().ok())
+            .max()
+            .unwrap_or(0);
+        format!("Marker {:02}", n + 1)
+    }
+
+    /// Index of the first marker strictly after `frame`, and of the last strictly before it.
+    pub fn marker_after(&self, frame: usize) -> Option<usize> {
+        self.markers.iter().position(|m| m.at > frame)
+    }
+
+    pub fn marker_before(&self, frame: usize) -> Option<usize> {
+        self.markers.iter().rposition(|m| m.at < frame)
     }
 }
 

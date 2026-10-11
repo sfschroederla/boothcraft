@@ -12,3 +12,5 @@ boothcraft-core.workspace = true
 thiserror.workspace = true
 cpal = "0.18"
 arc-swap = "1"
+boothcraft-dsp.workspace = true
+rtrb = "0.4"
