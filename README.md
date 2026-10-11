@@ -4,7 +4,8 @@ An open-source, cross-platform audio editor in Rust, aiming for feature parity w
 editor of professional desktop audio tools. Multitrack sessions are out of scope.
 
 ## Status
-<img width="1392" height="904" alt="Screenshot 2026-10-11 at 00 14 50" src="https://github.com/user-attachments/assets/4ad31479-df69-4c21-8cc5-f7576343400b" />Milestones 1 (the core editor, apart from a disk-backed block store) and 2 (the effects framework and first 22 effects) are in place. See [docs/parity.md](docs/parity.md).
+<img width="2560" height="1440" alt="Screenshot 2026-10-11 at 03 34 49" src="https://github.com/user-attachments/assets/e4cf55c1-dc77-426d-809c-81a96c5c2bfe" />
+Milestones 3 (the core editor, apart from a disk-backed block store) and 2 (the effects framework and first 22 effects) are in place. See [docs/parity.md](docs/parity.md).
 
 ## Build and run
 
