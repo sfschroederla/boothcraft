@@ -142,8 +142,9 @@ impl HostContext {
 pub trait PluginFormat: Send + Sync {
     fn kind(&self) -> &'static str;
 
-    /// Files to consider, in the format's standard locations plus `extra`. Never loads plugin code.
-    fn discover(&self, extra: &[PathBuf]) -> Vec<Candidate>;
+    /// Files to consider: `extra` folders, plus the format's standard install locations when
+    /// `include_standard` is set. Never loads plugin code.
+    fn discover(&self, extra: &[PathBuf], include_standard: bool) -> Vec<Candidate>;
 
     /// Plugins that need no scanning because the format ships them (the mock format). Registered
     /// in the catalog at startup.
@@ -180,6 +181,12 @@ pub trait PluginInstance {
         cfg: &ProcessConfig,
     ) -> Result<(Box<dyn PluginProcessor>, Activated), HostError>;
     fn deactivate(&mut self, mt: MainThread, processor: Box<dyn PluginProcessor>);
+    /// Parameter values the processor must be told about because the saved state alone does not
+    /// carry them (VST3 only moves an edit into the component through `process`). The host
+    /// queues these into every new processor.
+    fn pending_params(&self) -> Vec<(u32, f32)> {
+        Vec::new()
+    }
     /// Current latency in frames (may change after activation or processing).
     fn latency(&self) -> usize;
     fn tail(&self) -> usize;

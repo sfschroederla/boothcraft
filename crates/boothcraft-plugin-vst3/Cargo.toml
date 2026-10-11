@@ -1,0 +1,39 @@
+[package]
+name = "boothcraft-plugin-vst3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Unlike the other crates this one calls into plugin binaries, so it cannot inherit the
+# workspace's `unsafe_code = "forbid"` (a crate cannot relax a forbid). These lints are the
+# workspace's, copied by hand, with `deny` so each module that needs unsafe says so explicitly.
+# `scripts/check_lints.sh` enforces this.
+[lints.rust]
+unsafe_code = "deny"
+
+[features]
+# Integration tests that load real VST3 plugins built from the Steinberg SDK
+# (see scripts/build_vst3_fixtures.sh).
+integration = []
+
+[dependencies]
+boothcraft-plugin.workspace = true
+boothcraft-dsp.workspace = true
+vst3 = "=0.3.0"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+libloading = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+libloading = "0.8"
+
+[dev-dependencies]
+libtest-mimic = "0.8"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+harness = false
+required-features = ["integration"]

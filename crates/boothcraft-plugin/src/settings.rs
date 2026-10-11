@@ -6,7 +6,11 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// `…/Boothcraft/plugins`, or `None` if the platform has no config directory.
+/// `BOOTHCRAFT_PLUGIN_DIR` overrides it (tests, CI, portable installs).
 pub fn default_dir() -> Option<PathBuf> {
+    if let Some(d) = std::env::var_os("BOOTHCRAFT_PLUGIN_DIR") {
+        return Some(PathBuf::from(d));
+    }
     directories::ProjectDirs::from("", "", "Boothcraft").map(|d| d.config_dir().join("plugins"))
 }
 

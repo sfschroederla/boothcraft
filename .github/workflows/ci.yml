@@ -34,3 +34,41 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  plugins:
+    # Loads real VST3 plugins built from Steinberg's SDK. macOS is verified; the Windows and Linux
+    # legs run the same code but have not been seen to pass yet, so they report without blocking.
+    name: vst3 integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os != 'macos-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux audio and windowing headers
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libxkbcommon-dev libwayland-dev \
+            libx11-dev libxcb1-dev libgtk-3-dev libxdo-dev
+      - name: Cache SDK fixtures
+        uses: actions/cache@v4
+        with:
+          path: target/vst3-fixtures/work
+          key: vst3-fixtures-${{ runner.os }}-${{ hashFiles('scripts/build_vst3_fixtures.sh') }}
+      - name: Build SDK example plugins
+        id: fixtures
+        run: echo "dir=$(scripts/build_vst3_fixtures.sh)" >> "$GITHUB_OUTPUT"
+      - name: VST3 integration tests
+        env:
+          BOOTHCRAFT_VST3_TEST_DIR: ${{ steps.fixtures.outputs.dir }}
+        run: cargo test -p boothcraft-plugin-vst3 --features integration --test integration
+      - name: Mock plugin host tests
+        run: cargo test -p boothcraft-plugin --features mock

@@ -55,6 +55,9 @@ pub struct ScanConfig {
     pub timeout: Duration,
     pub retry_timeout: Duration,
     pub parallel: usize,
+    /// Also search each format's standard install locations (the default). Off, only the extra
+    /// folders given are searched.
+    pub standard_locations: bool,
 }
 
 impl ScanConfig {
@@ -64,6 +67,7 @@ impl ScanConfig {
             timeout: Duration::from_secs(30),
             retry_timeout: Duration::from_secs(120),
             parallel: 4,
+            standard_locations: true,
         }
     }
 }
@@ -228,7 +232,7 @@ pub fn scan(
     for format in formats {
         let kind = format.kind();
         let mut todo: Vec<Candidate> = Vec::new();
-        for cand in format.discover(extra) {
+        for cand in format.discover(extra, cfg.standard_locations) {
             if !format.needs_probe() {
                 // Nothing to load: the candidate already says what it holds.
                 if let Some(known) = cand.known {

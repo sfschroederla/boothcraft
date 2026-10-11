@@ -109,7 +109,7 @@ impl PluginFormat for MockFormat {
         "mock"
     }
 
-    fn discover(&self, extra: &[PathBuf]) -> Vec<Candidate> {
+    fn discover(&self, extra: &[PathBuf], _include_standard: bool) -> Vec<Candidate> {
         let mut out: Vec<Candidate> = extra
             .iter()
             .flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten())

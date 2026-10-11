@@ -1,0 +1,18 @@
+[package]
+name = "boothcraft-vst3-test-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "A tiny VST3 effect used by the host's integration tests: reports a configurable latency and asks to be restarted when it changes."
+
+# Implements a plugin, so it needs unsafe code (see `boothcraft-plugin-vst3` for why the lints are
+# copied by hand). `scripts/check_lints.sh` knows this crate.
+[lints.rust]
+unsafe_code = "deny"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vst3 = "=0.3.0"

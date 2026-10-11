@@ -4,7 +4,8 @@ use boothcraft_ui::BoothcraftApp;
 #[cfg(feature = "plugins")]
 fn plugin_formats() -> Vec<Box<dyn boothcraft_plugin::PluginFormat>> {
     #[allow(unused_mut)]
-    let mut formats: Vec<Box<dyn boothcraft_plugin::PluginFormat>> = Vec::new();
+    let mut formats: Vec<Box<dyn boothcraft_plugin::PluginFormat>> =
+        vec![Box::new(boothcraft_plugin_vst3::Vst3Format::new())];
     #[cfg(feature = "mock-plugins")]
     if std::env::var("BOOTHCRAFT_PLUGINS").is_ok_and(|v| v == "mock") {
         formats.push(Box::new(boothcraft_plugin::mock::MockFormat::new()));

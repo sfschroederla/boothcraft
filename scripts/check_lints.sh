@@ -8,7 +8,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-FFI_CRATES=" boothcraft-plugin-vst3 boothcraft-plugin-au boothcraft-plugin-window "
+FFI_CRATES=" boothcraft-plugin-vst3 boothcraft-plugin-au boothcraft-plugin-window boothcraft-vst3-test-plugin "
 fail=0
 for manifest in crates/*/Cargo.toml; do
   name=$(basename "$(dirname "$manifest")")

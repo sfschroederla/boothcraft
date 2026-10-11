@@ -658,14 +658,19 @@ impl PluginManager {
             activated,
             processor: None,
         });
-        Ok(Box::new(PluginEffect::new(
+        let mut effect = PluginEffect::new(
             slot.id,
             processor,
             &params,
             activated,
             pcfg.max_block,
             live.status.clone(),
-        )))
+        );
+        // Edits the saved state does not carry reach the processor with its first block.
+        for (id, v) in inst.pending_params() {
+            effect.queue_by_id(id, v);
+        }
+        Ok(Box::new(effect))
     }
 }
 

@@ -9,11 +9,12 @@ workspace = true
 
 [features]
 default = ["plugins"]
-plugins = ["dep:boothcraft-plugin"]
+plugins = ["dep:boothcraft-plugin", "dep:boothcraft-plugin-vst3"]
 mock-plugins = ["plugins", "boothcraft-plugin/mock"]
 
 [dependencies]
 boothcraft-plugin = { workspace = true, optional = true }
+boothcraft-plugin-vst3 = { workspace = true, optional = true }
 boothcraft-core.workspace = true
 boothcraft-io.workspace = true
 boothcraft-dsp.workspace = true

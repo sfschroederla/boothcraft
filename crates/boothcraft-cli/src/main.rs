@@ -29,9 +29,19 @@ enum Command {
     /// List the built-in effects and their parameters.
     Effects,
     /// Apply one effect to a whole file: `apply --effect amplify --param left=6 in.wav out.wav`.
+    ///
+    /// Plugins are named by the ids `plugins list` prints (`vst3:<class id>`); their parameters are
+    /// set by name or id, normalized 0..1 (a stepped parameter takes its step number). `--rack`
+    /// applies a saved rack file instead of one effect.
     Apply {
-        #[arg(long)]
-        effect: String,
+        #[arg(long, required_unless_present = "rack")]
+        effect: Option<String>,
+        /// A rack saved from the app (`.json`), instead of `--effect`.
+        #[arg(long, conflicts_with = "effect")]
+        rack: Option<PathBuf>,
+        /// A plugin's saved state (as stored in a rack file), loaded before `--param`s apply.
+        #[arg(long, requires = "effect")]
+        state: Option<PathBuf>,
         /// Parameter settings as id=value (repeatable).
         #[arg(long = "param", value_parser = parse_kv)]
         params: Vec<(String, f32)>,
@@ -67,7 +77,14 @@ enum Command {
 #[derive(Subcommand)]
 enum PluginsCommand {
     /// Scan for plugins (each in its own child process) and update the cache.
-    Scan,
+    Scan {
+        /// An extra folder to search, for this run (repeatable).
+        #[arg(long = "path")]
+        paths: Vec<PathBuf>,
+        /// Search only the `--path` folders, not the standard plugin folders.
+        #[arg(long, requires = "paths")]
+        only_given_paths: bool,
+    },
     /// List the plugins found by the last scan.
     List {
         /// Machine-readable output.
@@ -80,7 +97,8 @@ enum PluginsCommand {
 #[cfg(feature = "plugins")]
 fn plugin_formats() -> Vec<Box<dyn boothcraft_plugin::PluginFormat>> {
     #[allow(unused_mut)]
-    let mut formats: Vec<Box<dyn boothcraft_plugin::PluginFormat>> = Vec::new();
+    let mut formats: Vec<Box<dyn boothcraft_plugin::PluginFormat>> =
+        vec![Box::new(boothcraft_plugin_vst3::Vst3Format::new())];
     #[cfg(feature = "mock-plugins")]
     if std::env::var("BOOTHCRAFT_PLUGINS").is_ok_and(|v| v == "mock") {
         formats.push(Box::new(boothcraft_plugin::mock::MockFormat::new()));
@@ -98,8 +116,13 @@ fn plugins_command(action: PluginsCommand) -> Result<()> {
         std::sync::Arc::new(|| {}),
     );
     match action {
-        PluginsCommand::Scan => {
-            let cfg = ScanConfig::new(WorkerCommand::current_exe()?);
+        PluginsCommand::Scan {
+            paths,
+            only_given_paths,
+        } => {
+            manager.settings.extra_paths.extend(paths);
+            let mut cfg = ScanConfig::new(WorkerCommand::current_exe()?);
+            cfg.standard_locations = !only_given_paths;
             let r = manager.scan_blocking(&cfg);
             println!(
                 "probed {}, cached {}, found {} plugin(s)",
@@ -130,6 +153,101 @@ fn plugins_command(action: PluginsCommand) -> Result<()> {
         }
     }
     manager.shutdown(Vec::new());
+    Ok(())
+}
+
+/// Apply plugins (a single `--effect vst3:…`, or every slot of a `--rack` file) to the whole
+/// document, through new offline instances with latency compensated.
+#[cfg(feature = "plugins")]
+fn apply_with_plugins(
+    effect: Option<&str>,
+    rack: Option<&std::path::Path>,
+    state: Option<&std::path::Path>,
+    params: &[(String, f32)],
+    doc: &mut boothcraft_core::Document,
+) -> Result<()> {
+    use boothcraft_dsp::rack::{render_offline_with, OFFLINE_BLOCK};
+    use boothcraft_dsp::{PluginState, RackConfig, RackDesc};
+    use boothcraft_plugin::{MainThread, PluginManager};
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+
+    let mut manager = PluginManager::new(
+        MainThread::init(),
+        plugin_formats(),
+        boothcraft_plugin::settings::default_dir(),
+        std::sync::Arc::new(|| {}),
+    );
+    let mut desc = match rack {
+        Some(path) => boothcraft_dsp::preset::load_rack(path)
+            .with_context(|| format!("reading {}", path.display()))?,
+        None => RackDesc::default(),
+    };
+    if let Some(id) = effect {
+        let d = manager
+            .catalog()
+            .get(id)
+            .cloned()
+            .with_context(|| format!("no plugin {id:?}; run `boothcraft-cli plugins scan`"))?;
+        let mut slot = manager.new_slot(&d);
+        if let Some(path) = state {
+            slot.state = Some(PluginState(
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+            ));
+        }
+        manager
+            .ensure_loaded(&slot)
+            .map_err(|e| anyhow::anyhow!("{id}: {e}"))?;
+        let infos = manager
+            .params(slot.id)
+            .context("plugin has no parameters")?;
+        for (key, value) in params {
+            let p = infos
+                .iter()
+                .find(|p| p.name.eq_ignore_ascii_case(key) || p.id.to_string() == *key)
+                .with_context(|| {
+                    let names: Vec<_> = infos.iter().map(|p| p.name.as_str()).collect();
+                    format!("{id} has no parameter {key:?}; it has {names:?}")
+                })?;
+            manager.edit_param(slot.id, p.id, *value);
+        }
+        desc.slots[0] = Some(slot);
+    } else {
+        anyhow::ensure!(params.is_empty(), "--param needs --effect");
+    }
+    manager.snapshot(&mut desc);
+
+    let n = doc.frames();
+    let mut chans: Vec<Vec<f32>> = doc.channels.iter().map(|c| c.to_vec(0..n)).collect();
+    let cfg = RackConfig {
+        sample_rate: doc.sample_rate as f32,
+        channels: chans.len(),
+        max_block: OFFLINE_BLOCK,
+    };
+    let (mut built, errors) = manager
+        .prepare_offline(&desc, &cfg)
+        .poll()
+        .context("a plugin is still loading")?
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if !errors.is_empty() {
+        let why: Vec<String> = errors
+            .iter()
+            .map(|(i, e)| format!("slot {}: {e}", i + 1))
+            .collect();
+        manager.finish_offline(built);
+        manager.shutdown(Vec::new());
+        bail!("cannot apply: {}", why.join("; "));
+    }
+    let done = render_offline_with(
+        &mut built,
+        &mut chans,
+        &AtomicU32::new(0),
+        &AtomicBool::new(false),
+    );
+    manager.finish_offline(built);
+    manager.shutdown(Vec::new());
+    anyhow::ensure!(done, "rendering did not complete");
+    let slices: Vec<&[f32]> = chans.iter().map(Vec::as_slice).collect();
+    doc.overwrite(0, &slices);
     Ok(())
 }
 
@@ -242,6 +360,8 @@ fn main() -> Result<()> {
         }
         Command::Apply {
             effect,
+            rack,
+            state,
             params,
             input,
             output,
@@ -252,13 +372,35 @@ fn main() -> Result<()> {
             };
             let mut doc = boothcraft_io::read(&input)
                 .with_context(|| format!("reading {}", input.display()))?;
-            apply_effect(&effect, &params, &mut doc)?;
+            let label = match (&effect, &rack) {
+                (Some(e), _) => e.clone(),
+                (None, Some(r)) => r.display().to_string(),
+                (None, None) => unreachable!("clap requires one of --effect and --rack"),
+            };
+            let is_plugin = effect
+                .as_deref()
+                .is_some_and(boothcraft_dsp::registry::is_plugin_id);
+            if is_plugin || rack.is_some() {
+                #[cfg(feature = "plugins")]
+                apply_with_plugins(
+                    effect.as_deref(),
+                    rack.as_deref(),
+                    state.as_deref(),
+                    &params,
+                    &mut doc,
+                )?;
+                #[cfg(not(feature = "plugins"))]
+                bail!("this build has no plugin support");
+            } else {
+                let _ = state;
+                apply_effect(effect.as_deref().unwrap_or_default(), &params, &mut doc)?;
+            }
             boothcraft_io::write(
                 &doc,
                 &output,
                 &boothcraft_io::WriteOptions::new(format, to_depth(depth)),
             )?;
-            println!("applied {effect} -> {}", output.display());
+            println!("applied {label} -> {}", output.display());
         }
         Command::Info { file } => {
             let doc = boothcraft_io::read(&file)

@@ -94,6 +94,11 @@ impl PluginEffect {
         }
     }
 
+    /// Queue a change by the format's own parameter id, for the next block.
+    pub fn queue_by_id(&mut self, id: u32, value: f32) {
+        self.queue.push(id, value);
+    }
+
     pub fn set_latency(&mut self, frames: usize) {
         self.latency = frames;
     }
