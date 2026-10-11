@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Build a standalone Boothcraft.app for macOS. Only builds boothcraft-app (the GUI) and its own
 # dependencies via `cargo build -p`, so this never needs boothcraft-cli to build successfully.
+#
+# Environment:
+#   UNIVERSAL=1   build aarch64 + x86_64 and merge them with lipo (needs both rustup targets)
+#   VERSION=x.y.z override the version in Info.plist (default: workspace Cargo.toml)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -10,9 +14,18 @@ PROFILE="release"
 BIN_NAME="boothcraft-app"
 APP_NAME="Boothcraft"
 BUNDLE_ID="com.schroeds.boothcraft"
-VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')"
+VERSION="${VERSION:-$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')}"
 
-cargo build --release -p "$BIN_NAME"
+if [[ "${UNIVERSAL:-0}" == "1" ]]; then
+    cargo build --release -p "$BIN_NAME" --target aarch64-apple-darwin
+    cargo build --release -p "$BIN_NAME" --target x86_64-apple-darwin
+    mkdir -p "target/$PROFILE"
+    lipo -create -output "target/$PROFILE/$BIN_NAME" \
+        "target/aarch64-apple-darwin/$PROFILE/$BIN_NAME" \
+        "target/x86_64-apple-darwin/$PROFILE/$BIN_NAME"
+else
+    cargo build --release -p "$BIN_NAME"
+fi
 
 OUT_DIR="target/$PROFILE/bundle/osx"
 APP_DIR="$OUT_DIR/$APP_NAME.app"
@@ -54,5 +67,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+# Apple Silicon refuses unsigned code, and lipo drops the linker's ad-hoc signature.
+codesign --force --deep --sign - "$APP_DIR"
 
 echo "Built $APP_DIR"

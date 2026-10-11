@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    name: macOS universal build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Boothcraft.app
+        env:
+          UNIVERSAL: "1"
+          VERSION: ${{ github.ref_name }}
+        run: |
+          VERSION="${VERSION#v}" scripts/macos_bundle.sh
+      - name: Package
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            target/release/bundle/osx/Boothcraft.app \
+            "Boothcraft-${{ github.ref_name }}-macos-universal.zip"
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset="Boothcraft-${{ github.ref_name }}-macos-universal.zip"
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release upload "${{ github.ref_name }}" "$asset" --clobber
+          else
+            gh release create "${{ github.ref_name }}" "$asset" \
+              --title "${{ github.ref_name }}" --generate-notes
+          fi
