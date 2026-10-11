@@ -1,16 +1,51 @@
+use boothcraft_core::Selection;
+
 /// Horizontal view of a document: which frame is at the left edge and how many frames per pixel.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct View {
     pub start: f64,
     pub frames_per_px: f64,
+    /// Vertical (amplitude) zoom shared by all channels; 1.0 shows full scale.
+    pub amp: f32,
 }
+
+pub const AMP_MIN: f32 = 0.25;
+pub const AMP_MAX: f32 = 256.0;
 
 impl View {
     pub fn fit(total_frames: usize, width_px: f32) -> View {
         View {
             start: 0.0,
             frames_per_px: (total_frames as f64 / width_px.max(1.0) as f64).max(MIN_FPP),
+            amp: 1.0,
         }
+    }
+
+    /// Fit the whole file horizontally, keeping the amplitude zoom.
+    pub fn fit_horizontal(&mut self, total_frames: usize, width_px: f32) {
+        *self = View {
+            amp: self.amp,
+            ..View::fit(total_frames, width_px)
+        };
+    }
+
+    /// Show `range` with a little margin on each side.
+    pub fn zoom_to_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        total_frames: usize,
+        width_px: f32,
+    ) {
+        let len = (range.end - range.start).max(1) as f64;
+        let max_fpp = (total_frames as f64 / width_px.max(1.0) as f64).max(MIN_FPP);
+        self.frames_per_px = (len * 1.1 / width_px.max(1.0) as f64).clamp(MIN_FPP, max_fpp);
+        let centre = (range.start + range.end) as f64 / 2.0;
+        self.start = centre - self.visible_frames(width_px) / 2.0;
+        self.clamp(total_frames, width_px);
+    }
+
+    pub fn zoom_amp(&mut self, factor: f32) {
+        self.amp = (self.amp * factor).clamp(AMP_MIN, AMP_MAX);
     }
 
     pub fn px_to_frame(&self, px: f32) -> f64 {
@@ -76,6 +111,32 @@ pub fn format_time(frame: f64, sample_rate: u32) -> String {
     }
 }
 
+/// If a press at pixel `x` (relative to the view's left edge) is within `thresh` pixels of an edge of
+/// a non-empty selection, return the frame of the *opposite* edge, which stays fixed while dragging.
+pub fn edge_drag_anchor(sel: Selection, view: &View, x: f32, thresh: f32) -> Option<usize> {
+    if sel.is_empty() {
+        return None;
+    }
+    let ds = (view.frame_to_px(sel.start as f64) - x).abs();
+    let de = (view.frame_to_px(sel.end as f64) - x).abs();
+    if ds.min(de) > thresh {
+        None
+    } else if ds <= de {
+        Some(sel.end)
+    } else {
+        Some(sel.start)
+    }
+}
+
+/// Anchor for shift-extending a selection to `at`: the edge farther from `at` stays put.
+pub fn extend_anchor(sel: Selection, at: usize) -> usize {
+    if at.abs_diff(sel.start) <= at.abs_diff(sel.end) {
+        sel.end
+    } else {
+        sel.start
+    }
+}
+
 pub fn db(linear: f32) -> f32 {
     20.0 * linear.max(1e-6).log10()
 }
@@ -106,11 +167,57 @@ mod tests {
         let mut v = View {
             start: 0.0,
             frames_per_px: 1.0,
+            amp: 1.0,
         };
         v.pan_px(-50.0, 1000, 100.0);
         assert_eq!(v.start, 0.0);
         v.pan_px(5000.0, 1000, 100.0);
         assert_eq!(v.start, 900.0);
+    }
+
+    #[test]
+    fn zoom_to_range_centres_selection() {
+        let mut v = View::fit(1_000_000, 1000.0);
+        v.zoom_to_range(100_000..200_000, 1_000_000, 1000.0);
+        let (l, r) = (v.frame_to_px(100_000.0), v.frame_to_px(200_000.0));
+        assert!(
+            l > 0.0 && r < 1000.0,
+            "selection visible with margin: {l}..{r}"
+        );
+        assert!(((l + r) / 2.0 - 500.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn amp_zoom_is_bounded() {
+        let mut v = View::fit(1000, 100.0);
+        for _ in 0..20 {
+            v.zoom_amp(2.0);
+        }
+        assert_eq!(v.amp, AMP_MAX);
+        for _ in 0..40 {
+            v.zoom_amp(0.5);
+        }
+        assert_eq!(v.amp, AMP_MIN);
+    }
+
+    #[test]
+    fn edge_pick_and_extend() {
+        let v = View {
+            start: 0.0,
+            frames_per_px: 1.0,
+            amp: 1.0,
+        };
+        let sel = Selection::new(100, 300);
+        assert_eq!(edge_drag_anchor(sel, &v, 102.0, 5.0), Some(300));
+        assert_eq!(edge_drag_anchor(sel, &v, 297.0, 5.0), Some(100));
+        assert_eq!(edge_drag_anchor(sel, &v, 200.0, 5.0), None);
+        assert_eq!(
+            edge_drag_anchor(Selection::cursor(100), &v, 100.0, 5.0),
+            None
+        );
+        assert_eq!(extend_anchor(sel, 350), 100);
+        assert_eq!(extend_anchor(sel, 50), 300);
+        assert_eq!(extend_anchor(Selection::cursor(200), 500), 200);
     }
 
     #[test]

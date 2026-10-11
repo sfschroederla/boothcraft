@@ -3,6 +3,7 @@
 mod app;
 mod meters;
 mod ops;
+mod scale;
 mod view;
 mod waveform;
 

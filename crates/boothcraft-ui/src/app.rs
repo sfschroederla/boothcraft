@@ -49,6 +49,7 @@ struct State {
     follow: bool,
     looping: bool,
     dialog: Option<Dialog>,
+    display: waveform::DisplayOptions,
 }
 
 pub struct BoothcraftApp {
@@ -85,6 +86,7 @@ impl BoothcraftApp {
             follow: true,
             looping: false,
             dialog: None,
+            display: waveform::DisplayOptions::default(),
         };
         for p in paths {
             state.open(&p);
@@ -528,8 +530,9 @@ impl TabViewer for Viewer<'_> {
                 let playhead = s.playhead();
                 let playing = s.shared.as_ref().is_some_and(|sh| sh.is_playing());
                 let follow = s.follow && playing;
+                let zoom = waveform::toolbar(ui, &mut s.display, !s.files.is_empty());
                 if let Some(f) = s.files.get_mut(s.active) {
-                    let ev = waveform::show(ui, f, playhead, follow);
+                    let ev = waveform::show(ui, f, playhead, follow, &s.display, zoom);
                     if let (Some(at), Some(sh)) = (ev.seek, &s.shared) {
                         sh.seek(at);
                     }

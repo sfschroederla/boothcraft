@@ -27,6 +27,7 @@ impl OpenFile {
             view: crate::view::View {
                 start: 0.0,
                 frames_per_px: 1.0,
+                amp: 1.0,
             },
             saved_at: 0,
             revision: 0,
