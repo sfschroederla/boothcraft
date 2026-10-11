@@ -9,4 +9,4 @@ workspace = true
 
 [dependencies]
 boothcraft-ui.workspace = true
-eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "persistence"] }

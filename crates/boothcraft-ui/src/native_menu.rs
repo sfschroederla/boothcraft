@@ -38,6 +38,9 @@ pub const PANEL_LABELS: [&str; 9] = [
 pub enum Action {
     NewFile,
     Open,
+    /// Index into the recent-files list, as of the last `sync`.
+    OpenRecent(usize),
+    ClearRecent,
     Save,
     SaveAs,
     Close,
@@ -97,6 +100,8 @@ pub struct SyncState<'a> {
     pub freq_axis: FreqAxis,
     /// Same order/length as [`PANEL_LABELS`].
     pub panels_open: &'a [bool],
+    /// Most-recently-opened first.
+    pub recent_files: &'a [std::path::PathBuf],
 }
 
 pub struct NativeMenu {
@@ -137,6 +142,12 @@ pub struct NativeMenu {
     panels: Vec<CheckMenuItem>,
     effects_menu: Submenu,
     generate_silence: MenuItem,
+    recent_menu: Submenu,
+    /// The recent-files list the "Open Recent" submenu currently reflects; rebuilt only when
+    /// `sync`'s input differs from this, since rebuilding tears down and recreates native
+    /// `NSMenuItem`s (wasteful, and a little janky, to do every frame for a menu that's shown
+    /// rarely and changes even more rarely).
+    last_recent: Vec<std::path::PathBuf>,
 }
 
 /// Build the native menu bar and install it as the app's menu (`NSApp.mainMenu`). Call once at
@@ -177,6 +188,12 @@ pub fn install() -> NativeMenu {
     submenus.push(file_menu.clone());
     let new_file = MenuItem::new("New…", true, None);
     let open = MenuItem::new("Open…", true, None);
+    let recent_menu = Submenu::new("Open Recent", true);
+    submenus.push(recent_menu.clone());
+    let no_recent = MenuItem::new("No Recent Files", false, None);
+    recent_menu
+        .append(&no_recent)
+        .expect("static menu construction");
     let save = MenuItem::new("Save", true, None);
     let save_as = MenuItem::new("Save As…", true, None);
     let close = MenuItem::new("Close", true, None);
@@ -184,6 +201,7 @@ pub fn install() -> NativeMenu {
         .append_items(&[
             &new_file,
             &open,
+            &recent_menu,
             &save,
             &save_as,
             &PredefinedMenuItem::separator(),
@@ -509,6 +527,8 @@ pub fn install() -> NativeMenu {
         panels,
         effects_menu,
         generate_silence,
+        recent_menu,
+        last_recent: Vec::new(),
     }
 }
 
@@ -525,8 +545,12 @@ impl NativeMenu {
     }
 
     /// Refresh every checked/enabled state from the app's current state. Cheap (plain property
-    /// setters on the native menu items); safe to call every frame.
-    pub fn sync(&self, s: &SyncState<'_>) {
+    /// setters on the native menu items); safe to call every frame. Rebuilds the "Open Recent"
+    /// submenu too, but only when its contents actually changed.
+    pub fn sync(&mut self, s: &SyncState<'_>) {
+        if s.recent_files != self.last_recent.as_slice() {
+            self.rebuild_recent(s.recent_files);
+        }
         for sub in &self.top_level {
             sub.set_enabled(!s.recording);
         }
@@ -577,5 +601,37 @@ impl NativeMenu {
         for (open, item) in s.panels_open.iter().zip(&self.panels) {
             item.set_checked(*open);
         }
+    }
+
+    /// Clears and repopulates "Open Recent" from `paths`. Stale dispatch entries for the removed
+    /// items are simply left orphaned in the map (harmless — it only grows by a handful of
+    /// entries per file actually opened, not per frame).
+    fn rebuild_recent(&mut self, paths: &[std::path::PathBuf]) {
+        while self.recent_menu.remove_at(0).is_some() {}
+        if paths.is_empty() {
+            let placeholder = MenuItem::new("No Recent Files", false, None);
+            self.recent_menu
+                .append(&placeholder)
+                .expect("menu mutation");
+        } else {
+            for (i, path) in paths.iter().enumerate() {
+                let label = path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                );
+                let item = MenuItem::new(label, true, None);
+                self.dispatch
+                    .insert(item.id().clone(), Action::OpenRecent(i));
+                self.recent_menu.append(&item).expect("menu mutation");
+            }
+            self.recent_menu
+                .append(&PredefinedMenuItem::separator())
+                .expect("menu mutation");
+            let clear = MenuItem::new("Clear Recent", true, None);
+            self.dispatch
+                .insert(clear.id().clone(), Action::ClearRecent);
+            self.recent_menu.append(&clear).expect("menu mutation");
+        }
+        self.last_recent = paths.to_vec();
     }
 }

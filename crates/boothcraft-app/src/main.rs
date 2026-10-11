@@ -17,4 +17,6 @@ fn egui_viewport() -> eframe::egui::ViewportBuilder {
     eframe::egui::ViewportBuilder::default()
         .with_inner_size([1280.0, 760.0])
         .with_title("Boothcraft")
+        // Fixes the folder eframe persists window geometry to, independent of the window title.
+        .with_app_id("com.schroeds.boothcraft")
 }

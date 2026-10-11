@@ -27,7 +27,7 @@ use egui_dock::{DockArea, DockState, NodeIndex, Style, TabViewer};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Tab {
     Editor,
     Files,
@@ -141,7 +141,12 @@ struct State {
     match_panel: MatchLoudnessPanel,
     /// Further jobs waiting to run after the current Apply (Match Loudness over several files).
     apply_queue: std::collections::VecDeque<(usize, String, ApplyKind)>,
+    /// Most-recently-opened first, capped at [`RECENT_FILES_MAX`]; persisted across launches.
+    recent_files: Vec<PathBuf>,
 }
+
+/// Longest "File > Open Recent" list kept.
+const RECENT_FILES_MAX: usize = 10;
 
 pub struct BoothcraftApp {
     dock: DockState<Tab>,
@@ -190,22 +195,41 @@ fn install_native_fonts(ctx: &egui::Context) {
 #[cfg(not(target_os = "macos"))]
 fn install_native_fonts(_ctx: &egui::Context) {}
 
+/// Storage keys for `eframe`'s persistence (only active with the "persistence" feature, which
+/// both `boothcraft-app` and `boothcraft-ui` enable on `eframe`). Window position/size persist
+/// automatically via `eframe`'s own mechanism; these two are ours.
+const DOCK_STORAGE_KEY: &str = "boothcraft-dock";
+const RECENT_FILES_STORAGE_KEY: &str = "boothcraft-recent-files";
+
+/// The default panel layout: a full-height left column (Files above Effects Rack), and to its
+/// right the editor on top with Selection/View + Markers, Phase Meter + Loudness and Levels
+/// underneath. The split fraction is the share kept by the *existing* node for
+/// `split_below`/`split_right`, but — despite the method docs implying otherwise — the share
+/// given to the *new* node for `split_left`/`split_above` (confirmed against egui_dock 0.21's own
+/// layout code).
+fn default_dock() -> DockState<Tab> {
+    let mut dock = DockState::new(vec![Tab::Editor]);
+    let surface = dock.main_surface_mut();
+    let [right, files] = surface.split_left(NodeIndex::root(), 1.0 / 3.0, vec![Tab::Files]);
+    surface.split_below(files, 0.5, vec![Tab::EffectsRack]);
+    let [_editor, bottom] = surface.split_below(right, 0.82, vec![Tab::Selection, Tab::Markers]);
+    let [_selection, rest] = surface.split_right(bottom, 0.2, vec![Tab::PhaseMeter, Tab::Loudness]);
+    surface.split_right(rest, 0.25, vec![Tab::Levels]);
+    dock
+}
+
 impl BoothcraftApp {
     pub fn new(cc: &eframe::CreationContext<'_>, paths: Vec<PathBuf>) -> BoothcraftApp {
         install_native_fonts(&cc.egui_ctx);
         let cleanup = boothcraft_core::install_cleanup_guard();
-        // Editor on top; Selection/View, Phase Meter and Levels side by side underneath. The split
-        // fraction is the share kept by the *existing* node.
-        let mut dock = DockState::new(vec![Tab::Editor]);
-        let surface = dock.main_surface_mut();
-        let [_editor, bottom] = surface.split_below(
-            NodeIndex::root(),
-            0.82,
-            vec![Tab::Selection, Tab::Markers, Tab::EffectsRack],
-        );
-        let [_selection, rest] =
-            surface.split_right(bottom, 0.2, vec![Tab::PhaseMeter, Tab::Loudness]);
-        surface.split_right(rest, 0.25, vec![Tab::Levels]);
+        let dock = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, DOCK_STORAGE_KEY))
+            .unwrap_or_else(default_dock);
+        let recent_files = cc
+            .storage
+            .and_then(|s| eframe::get_value(s, RECENT_FILES_STORAGE_KEY))
+            .unwrap_or_default();
 
         let (engine, status) = match Engine::new() {
             Ok(e) => {
@@ -248,6 +272,7 @@ impl BoothcraftApp {
             loudness: LoudnessPanel::new(tap),
             match_panel: MatchLoudnessPanel::default(),
             apply_queue: Default::default(),
+            recent_files,
         };
         for p in paths {
             state.open(&p);
@@ -278,9 +303,19 @@ impl State {
                 self.files
                     .push(OpenFile::new(name, Some(path.to_path_buf()), doc));
                 self.set_active(self.files.len() - 1);
+                self.remember_recent(path);
             }
             Err(e) => self.status = format!("Could not open {}: {e}", path.display()),
         }
+    }
+
+    /// Move `path` to the front of the recent-files list (adding it if new), capped at
+    /// [`RECENT_FILES_MAX`].
+    fn remember_recent(&mut self, path: &Path) {
+        let path = path.to_path_buf();
+        self.recent_files.retain(|p| p != &path);
+        self.recent_files.insert(0, path);
+        self.recent_files.truncate(RECENT_FILES_MAX);
     }
 
     fn set_active(&mut self, i: usize) {
@@ -800,6 +835,12 @@ impl State {
                 });
             }
             Action::Open => self.pick_and_open(),
+            Action::OpenRecent(i) => {
+                if let Some(path) = self.recent_files.get(i).cloned() {
+                    self.open(&path);
+                }
+            }
+            Action::ClearRecent => self.recent_files.clear(),
             Action::Save => self.save(false),
             Action::SaveAs => self.save(true),
             Action::Close => {
@@ -948,6 +989,31 @@ impl State {
                     self.pick_and_open();
                     ui.close();
                 }
+                ui.menu_button("Open Recent", |ui| {
+                    if self.recent_files.is_empty() {
+                        ui.add_enabled(false, egui::Button::new("No Recent Files"));
+                    } else {
+                        for path in self.recent_files.clone() {
+                            let label = path.file_name().map_or_else(
+                                || path.display().to_string(),
+                                |n| n.to_string_lossy().into_owned(),
+                            );
+                            if ui
+                                .button(label)
+                                .on_hover_text(path.display().to_string())
+                                .clicked()
+                            {
+                                self.open(&path);
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Clear Recent").clicked() {
+                            self.recent_files.clear();
+                            ui.close();
+                        }
+                    }
+                });
                 if ui.button("Save").clicked() {
                     self.save(false);
                     ui.close();
@@ -1847,6 +1913,7 @@ impl eframe::App for BoothcraftApp {
                 color_map: self.state.display.spectral.color_map,
                 freq_axis: self.state.display.spectral.freq_axis,
                 panels_open: &panels_open,
+                recent_files: &self.state.recent_files,
             });
         }
         #[cfg(not(target_os = "macos"))]
@@ -1881,5 +1948,13 @@ impl eframe::App for BoothcraftApp {
         if self.state.shared.as_ref().is_some_and(|s| s.is_playing()) {
             ctx.request_repaint();
         }
+    }
+
+    /// Persists panel placement and the recent-files list; window position/size are handled by
+    /// `eframe` itself. Only takes effect with the "persistence" feature enabled on `eframe`
+    /// (it is, for both `boothcraft-app` and `boothcraft-ui`).
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, DOCK_STORAGE_KEY, &self.dock);
+        eframe::set_value(storage, RECENT_FILES_STORAGE_KEY, &self.state.recent_files);
     }
 }

@@ -12,10 +12,11 @@ boothcraft-core.workspace = true
 boothcraft-io.workspace = true
 boothcraft-dsp.workspace = true
 boothcraft-engine.workspace = true
-eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11"] }
-egui_dock = "0.21"
+eframe = { version = "0.36", default-features = false, features = ["wgpu", "default_fonts", "wayland", "x11", "persistence"] }
+egui_dock = { version = "0.21", features = ["serde"] }
 rfd = "0.15"
 egui = "0.36"
+serde = { version = "1", features = ["derive"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = { version = "0.21", default-features = false }
