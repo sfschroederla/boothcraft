@@ -300,6 +300,12 @@ impl BoothcraftApp {
             }
             Err(e) => (None, format!("No audio output ({e}); editing still works")),
         };
+        // Say how many plugins are known, so it is obvious from the first frame that plugin
+        // hosting is built in and whether a scan has been done.
+        let status = match &plugins {
+            Some(m) => format!("{status} · Plugins: {} known", m.catalog().len()),
+            None => status,
+        };
         let mut engine = engine;
         let rack_ctl = engine.as_mut().and_then(Engine::take_rack_control);
         let tap = engine.as_mut().and_then(Engine::take_tap);

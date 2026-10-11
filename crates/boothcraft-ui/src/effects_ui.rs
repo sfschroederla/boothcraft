@@ -714,7 +714,17 @@ impl RackPanel {
                             None => {
                                 ui.menu_button(RichText::new("+ Add effect").weak(), |ui| {
                                     if let Some(m) = &preview.plugins {
-                                        if !m.catalog().is_empty() {
+                                        if m.catalog().is_empty() {
+                                            ui.add_enabled(
+                                                false,
+                                                egui::Button::new("Plugins: none scanned yet"),
+                                            )
+                                            .on_disabled_hover_text(
+                                                "Run `boothcraft-cli plugins scan --path <folder> \
+                                                 --only-given-paths`, then restart the app",
+                                            );
+                                            ui.separator();
+                                        } else {
                                             ui.menu_button("Plugins", |ui| {
                                                 for (vendor, list) in m.catalog().by_vendor() {
                                                     ui.menu_button(vendor, |ui| {
