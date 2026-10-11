@@ -19,9 +19,13 @@ use crate::traits::*;
 use boothcraft_dsp::param::db_to_gain;
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+
+/// Set by probing `exitcrash`: the worker then crashes while exiting, like plugins whose static
+/// destructors crash.
+static CRASH_AT_EXIT: AtomicBool = AtomicBool::new(false);
 
 /// Counters a test reads to check what the host did.
 #[derive(Default)]
@@ -121,6 +125,13 @@ impl PluginFormat for MockFormat {
         out
     }
 
+    fn exit_scan_worker(&self, code: i32) -> ! {
+        if CRASH_AT_EXIT.load(Relaxed) {
+            std::process::abort();
+        }
+        std::process::exit(code)
+    }
+
     fn bundled(&self) -> Vec<PluginDescriptor> {
         ["gain", "gain-stereo", "delay:64"]
             .iter()
@@ -140,6 +151,16 @@ impl PluginFormat for MockFormat {
                 std::thread::sleep(std::time::Duration::from_secs(60));
             },
             "empty" => Ok(Vec::new()),
+            "exitcrash" | "chatty" => {
+                if stem == "chatty" {
+                    // Plugins print to stdout, including half lines.
+                    print!("loading plugin... {{\"status\":");
+                    println!("\nnoise");
+                } else {
+                    CRASH_AT_EXIT.store(true, Relaxed);
+                }
+                Ok(vec![descriptor(stem)])
+            }
             "bad" => Err(HostError::Load("not a plugin".into())),
             _ => {
                 if stem.starts_with("slow") {

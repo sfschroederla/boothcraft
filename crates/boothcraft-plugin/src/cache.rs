@@ -55,9 +55,24 @@ pub struct CacheEntry {
     pub outcome: Outcome,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Bumped when scanning changes in a way that makes old results untrustworthy. Version 2: a
+/// worker that crashed while *exiting* (after answering) used to be recorded as blocked.
+pub const CACHE_VERSION: u32 = 2;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanCache {
+    #[serde(default)]
+    pub version: u32,
     pub entries: BTreeMap<String, CacheEntry>,
+}
+
+impl Default for ScanCache {
+    fn default() -> Self {
+        ScanCache {
+            version: CACHE_VERSION,
+            entries: BTreeMap::new(),
+        }
+    }
 }
 
 pub fn key(format: &str, path: &Path) -> String {
@@ -66,10 +81,18 @@ pub fn key(format: &str, path: &Path) -> String {
 
 impl ScanCache {
     pub fn load(dir: &Path) -> ScanCache {
-        std::fs::read(dir.join("cache.json"))
+        let mut cache: ScanCache = std::fs::read(dir.join("cache.json"))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if cache.version < CACHE_VERSION {
+            // Blocks recorded by an older scanner may be false: probe those files again.
+            cache
+                .entries
+                .retain(|_, e| !matches!(e.outcome, Outcome::Blocked(_)));
+            cache.version = CACHE_VERSION;
+        }
+        cache
     }
 
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
@@ -121,5 +144,25 @@ impl ScanCache {
             Outcome::Ok(d) => d.as_slice(),
             _ => &[],
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocks_from_an_older_scanner_are_dropped_on_load() {
+        let dir = std::env::temp_dir().join(format!("bc-cache-ver-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = r#"{"entries":{
+            "vst3|/a.vst3":{"fingerprint":{"mtime_ns":1,"size":2},"outcome":{"Blocked":{"Crash":"x"}}},
+            "vst3|/b.vst3":{"fingerprint":{"mtime_ns":1,"size":2},"outcome":{"Invalid":"no effects"}}}}"#;
+        std::fs::write(dir.join("cache.json"), old).unwrap();
+        let c = ScanCache::load(&dir);
+        assert_eq!(c.version, CACHE_VERSION);
+        assert!(c.blocked().is_empty(), "the old block is forgotten");
+        assert_eq!(c.entries.len(), 1, "other results are kept");
+        std::fs::remove_dir_all(dir).ok();
     }
 }

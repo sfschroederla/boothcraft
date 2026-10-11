@@ -111,15 +111,18 @@ enum WorkerReply {
 /// first in `main`, before argument parsing. In worker mode it probes one file, prints the result
 /// as JSON and exits; otherwise it returns.
 pub fn maybe_run_scan_worker(formats: &[Box<dyn PluginFormat>]) {
+    use std::io::Write;
     let args: Vec<OsString> = std::env::args_os().collect();
     if args.get(1).map(|a| a == WORKER_FLAG) != Some(true) {
         return;
     }
+    let mut chosen: Option<&dyn PluginFormat> = None;
     let reply = match (args.get(2), args.get(3)) {
         (Some(kind), Some(path)) => {
             let kind = kind.to_string_lossy();
             match formats.iter().find(|f| f.kind() == kind) {
                 Some(f) => {
+                    chosen = Some(f.as_ref());
                     f.init_scan_worker();
                     let cand = Candidate {
                         path: PathBuf::from(path),
@@ -141,8 +144,20 @@ pub fn maybe_run_scan_worker(formats: &[Box<dyn PluginFormat>]) {
             message: "usage: --plugin-scan-worker <format> <path>".into(),
         },
     };
-    println!("{}", serde_json::to_string(&reply).unwrap_or_default());
-    std::process::exit(0);
+    // On its own line (plugins sometimes print to stdout too), then flushed: the reply must be
+    // out before anything else can go wrong.
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(
+        out,
+        "\n{}",
+        serde_json::to_string(&reply).unwrap_or_default()
+    );
+    let _ = out.flush();
+    drop(out);
+    match chosen {
+        Some(f) => f.exit_scan_worker(0),
+        None => std::process::exit(0),
+    }
 }
 
 enum Probe {
@@ -181,13 +196,20 @@ fn start(cfg: &ScanConfig, format: &str, index: usize, path: &Path) -> Result<Ru
 
 fn finish(run: Running, status: std::process::ExitStatus) -> Probe {
     let out = run.reader.join().unwrap_or_default();
-    if !status.success() {
-        return Probe::Crashed(format!("scan worker exited with {status}"));
-    }
-    match serde_json::from_slice::<WorkerReply>(&out) {
-        Ok(WorkerReply::Ok { descriptors }) => Probe::Done(descriptors),
-        Ok(WorkerReply::Error { message }) => Probe::Invalid(message),
-        Err(e) => Probe::Invalid(format!("unreadable scan worker reply: {e}")),
+    // The reply is what matters. A plugin that scanned fine but crashes while the process shuts
+    // down (very common) must not be blocked, so a complete reply wins over the exit status.
+    // Plugins also print to stdout, so look for the reply line rather than parsing everything.
+    let reply = String::from_utf8_lossy(&out)
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<WorkerReply>(l.trim()).ok());
+    match reply {
+        Some(WorkerReply::Ok { descriptors }) => Probe::Done(descriptors),
+        Some(WorkerReply::Error { message }) => Probe::Invalid(message),
+        None if !status.success() => {
+            Probe::Crashed(format!("scan worker died before answering ({status})"))
+        }
+        None => Probe::Invalid("the scan worker gave no readable answer".into()),
     }
 }
 

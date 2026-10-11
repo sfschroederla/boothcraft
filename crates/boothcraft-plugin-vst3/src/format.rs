@@ -111,6 +111,21 @@ impl PluginFormat for Vst3Format {
         hide_from_dock();
     }
 
+    fn exit_scan_worker(&self, code: i32) -> ! {
+        // End the process without running the plugins' static destructors or atexit handlers:
+        // many of them crash there (and every crash is a report in the user's logs).
+        #[cfg(unix)]
+        {
+            extern "C" {
+                fn _exit(code: i32) -> !;
+            }
+            // SAFETY: `_exit` takes no pointers and never returns; the reply was already flushed.
+            unsafe { _exit(code) }
+        }
+        #[cfg(not(unix))]
+        std::process::exit(code)
+    }
+
     fn needs_probe(&self) -> bool {
         true
     }

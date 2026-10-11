@@ -72,6 +72,24 @@ fn crashes_block_immediately_and_good_plugins_survive() {
 }
 
 #[test]
+fn a_plugin_that_crashes_while_exiting_is_not_blocked() {
+    // Many real plugins scan fine and then crash in their shutdown code.
+    let dir = temp("exitcrash");
+    touch(&dir, "exitcrash.mock");
+    touch(&dir, "chatty.mock"); // prints junk to stdout around the reply
+    let mut cache = ScanCache::default();
+    let report = scan(
+        &formats(),
+        &mut cache,
+        std::slice::from_ref(&dir),
+        &config(10_000, 10_000),
+    );
+    assert!(report.blocked.is_empty(), "blocked: {:?}", report.blocked);
+    assert_eq!(report.found, 2);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
 fn a_slow_plugin_is_retried_alone_and_not_blocked() {
     let dir = temp("slow");
     touch(&dir, "slow.mock"); // takes ~1.5 s to probe

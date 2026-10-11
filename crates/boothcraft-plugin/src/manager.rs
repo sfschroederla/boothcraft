@@ -234,6 +234,16 @@ impl PluginManager {
             .collect()
     }
 
+    /// Lift every block.
+    pub fn unblock_all(&mut self) {
+        for (path, _) in self.blocked() {
+            self.cache.unblock(&path);
+        }
+        if let Some(d) = &self.dir {
+            let _ = self.cache.save(d);
+        }
+    }
+
     /// Lift a block so the next scan probes the file again.
     pub fn unblock(&mut self, path: &std::path::Path) {
         self.cache.unblock(path);

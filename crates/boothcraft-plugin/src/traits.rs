@@ -156,6 +156,13 @@ pub trait PluginFormat: Send + Sync {
     /// Dock on macOS).
     fn init_scan_worker(&self) {}
 
+    /// End a scan worker process once its reply has been written. Plugins' own shutdown code
+    /// often crashes (static destructors, background threads), and nothing it does matters now,
+    /// so a format can end the process without running it. The default exits normally.
+    fn exit_scan_worker(&self, code: i32) -> ! {
+        std::process::exit(code)
+    }
+
     /// Whether `probe` must run in a scan worker. VST3 true (it loads the module); AU false.
     fn needs_probe(&self) -> bool;
 
