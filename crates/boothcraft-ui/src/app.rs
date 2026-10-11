@@ -1,19 +1,24 @@
-use crate::effects_ui::{
-    effects_by_category, ApplyJob, ApplyKind, EffectAction, EffectDialog, Preview, RackPanel,
-};
+#[cfg(not(target_os = "macos"))]
+use crate::effects_ui::effects_by_category;
+use crate::effects_ui::{ApplyJob, ApplyKind, EffectAction, EffectDialog, Preview, RackPanel};
 use crate::generate_ui::Generator;
 use crate::icons::{self, Icon};
 use crate::loudness_ui::{LoudnessPanel, MatchLoudnessPanel};
 use crate::markers_panel::{MarkerAction, MarkersPanel};
 use crate::meters::Meters;
-use crate::ops::{OpenFile, ZeroAdjust};
+use crate::ops::OpenFile;
+#[cfg(not(target_os = "macos"))]
+use crate::ops::ZeroAdjust;
 use crate::scale;
 use crate::selview_panel::SelViewPanel;
-use crate::spectral::{self, ColorMap, FreqAxis, ViewMode};
+use crate::spectral::ViewMode;
+#[cfg(not(target_os = "macos"))]
+use crate::spectral::{self, ColorMap, FreqAxis};
 use crate::view::format_time;
 use crate::waveform;
 use boothcraft_core::{Clipboards, Document, Rope, Selection};
 use boothcraft_dsp::convert::Downmix;
+#[cfg(not(target_os = "macos"))]
 use boothcraft_dsp::StftWindow;
 use boothcraft_engine::{Engine, Recorder, Shared, Take};
 use boothcraft_io::{BitDepth, Format, WriteOptions};
@@ -143,6 +148,8 @@ pub struct BoothcraftApp {
     state: State,
     /// Removes the disk-backed block store's segment directory when the app closes.
     _cleanup: boothcraft_core::CleanupGuard,
+    #[cfg(target_os = "macos")]
+    native_menu: crate::native_menu::NativeMenu,
 }
 
 /// On macOS, prefer the system's own San Francisco fonts over egui's bundled default (Ubuntu-Light),
@@ -249,6 +256,8 @@ impl BoothcraftApp {
             dock,
             state,
             _cleanup: cleanup,
+            #[cfg(target_os = "macos")]
+            native_menu: crate::native_menu::install(),
         }
     }
 }
@@ -773,6 +782,155 @@ impl State {
         }
     }
 
+    /// Handle a click from the native macOS menu bar, mirroring exactly what the corresponding
+    /// button closure in `menu()` does (that function is still used, unchanged, on other
+    /// platforms; this is its native-menu equivalent).
+    #[cfg(target_os = "macos")]
+    fn dispatch_native_action(
+        &mut self,
+        dock: &mut DockState<Tab>,
+        action: crate::native_menu::Action,
+    ) {
+        use crate::native_menu::Action;
+        match action {
+            Action::NewFile => {
+                self.dialog = Some(Dialog::NewFile {
+                    rate: 48_000,
+                    channels: 2,
+                });
+            }
+            Action::Open => self.pick_and_open(),
+            Action::Save => self.save(false),
+            Action::SaveAs => self.save(true),
+            Action::Close => {
+                if self.active < self.files.len() {
+                    self.files.remove(self.active);
+                    self.active = self.active.saturating_sub(1);
+                    self.synced = None;
+                    self.stop();
+                }
+            }
+            Action::Undo => {
+                if let Some(f) = self.files.get_mut(self.active) {
+                    f.undo();
+                }
+            }
+            Action::Redo => {
+                if let Some(f) = self.files.get_mut(self.active) {
+                    f.redo();
+                }
+            }
+            Action::Cut => {
+                let clips = &mut self.clips;
+                if let Some(f) = self.files.get_mut(self.active) {
+                    f.cut(clips);
+                }
+            }
+            Action::Copy => {
+                let clips = &mut self.clips;
+                if let Some(f) = self.files.get_mut(self.active) {
+                    f.copy(clips);
+                }
+            }
+            Action::Paste => {
+                let clips = &mut self.clips;
+                if let Some(f) = self.files.get_mut(self.active) {
+                    f.paste(clips);
+                }
+            }
+            Action::MixPaste => {
+                let clips = &mut self.clips;
+                if let Some(f) = self.files.get_mut(self.active) {
+                    f.mix_paste(clips);
+                }
+            }
+            Action::Delete => {
+                if let Some(f) = self.files.get_mut(self.active) {
+                    f.delete();
+                }
+            }
+            Action::CropToSelection => {
+                if let Some(f) = self.files.get_mut(self.active) {
+                    f.crop();
+                }
+            }
+            Action::SelectAll => {
+                if let Some(f) = self.files.get_mut(self.active) {
+                    f.select_all();
+                }
+            }
+            Action::ZeroAdjust(mode) => {
+                if let Some(f) = self.files.get_mut(self.active) {
+                    f.adjust_zero_crossings(mode);
+                }
+            }
+            Action::ToggleSnapEnabled => self.display.snap.enabled = !self.display.snap.enabled,
+            Action::ToggleSnapMarkers => self.display.snap.markers = !self.display.snap.markers,
+            Action::ToggleSnapRuler => self.display.snap.ruler = !self.display.snap.ruler,
+            Action::ToggleSnapZeroCrossings => {
+                self.display.snap.zero_crossings = !self.display.snap.zero_crossings;
+            }
+            Action::ConvertSampleType => {
+                if let Some(f) = self.files.get(self.active) {
+                    let (rate, channels) = (f.doc().sample_rate, f.doc().channel_count().min(2));
+                    self.dialog = Some(Dialog::ConvertSampleType {
+                        rate,
+                        channels,
+                        downmix: Downmix::Mix,
+                    });
+                }
+            }
+            Action::Preferences => {
+                self.dialog = Some(Dialog::Preferences {
+                    preroll: self.preroll_secs,
+                    postroll: self.postroll_secs,
+                    memory_budget_mb: boothcraft_core::BlockStore::global().budget_mb(),
+                });
+            }
+            Action::SelectClipboard(i) => self.clips.active = i,
+            Action::SetViewMode(mode) => self.display.spectral.mode = mode,
+            Action::SetFftSize(size) => self.display.spectral.fft_size = size,
+            Action::SetWindow(w) => self.display.spectral.window = w,
+            Action::SetColorMap(m) => self.display.spectral.color_map = m,
+            Action::SetFreqAxis(a) => self.display.spectral.freq_axis = a,
+            Action::Invert => {
+                if self.active < self.files.len() {
+                    self.files[self.active].invert();
+                }
+            }
+            Action::Reverse => {
+                if self.active < self.files.len() {
+                    self.files[self.active].reverse();
+                }
+            }
+            Action::Silence => {
+                if self.active < self.files.len() {
+                    self.files[self.active].silence();
+                }
+            }
+            Action::InsertSilence | Action::GenSilence => {
+                self.dialog = Some(Dialog::InsertSilence(1.0));
+            }
+            Action::OpenEffect(id) => self.effect_dialog = EffectDialog::new(id),
+            Action::GenTones => self.generator = Some(Generator::tone()),
+            Action::GenNoise => self.generator = Some(Generator::noise()),
+            Action::GenDtmf => self.generator = Some(Generator::dtmf()),
+            Action::TogglePanel(i) => {
+                if let Some(&tab) = WINDOW_TABS.get(i) {
+                    match dock.find_tab(&tab) {
+                        Some(path) => {
+                            dock.remove_tab(path);
+                        }
+                        None => show_panel(dock, tab),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The in-window menu bar, used on every platform except macOS (which gets a native menu bar
+    /// instead — see `dispatch_native_action` and `native_menu`).
+    #[cfg(not(target_os = "macos"))]
     fn menu(&mut self, ui: &mut egui::Ui, dock: &mut DockState<Tab>) {
         if self.recording.is_some() {
             ui.disable();
@@ -1028,17 +1186,7 @@ impl State {
                 }
             });
             ui.menu_button("Window", |ui| {
-                for tab in [
-                    Tab::Files,
-                    Tab::History,
-                    Tab::Selection,
-                    Tab::Markers,
-                    Tab::EffectsRack,
-                    Tab::PhaseMeter,
-                    Tab::Loudness,
-                    Tab::MatchLoudness,
-                    Tab::Levels,
-                ] {
+                for tab in WINDOW_TABS {
                     let open = dock.find_tab(&tab);
                     let mut checked = open.is_some();
                     if ui.checkbox(&mut checked, tab.title()).clicked() {
@@ -1463,6 +1611,20 @@ impl State {
 
 const TRANSPORT_H: f32 = 36.0;
 
+/// The dockable, non-`Editor` panels offered by the Window menu, in menu order. On macOS this
+/// doubles as the native menu's panel list (`native_menu::PANEL_LABELS`, same order).
+const WINDOW_TABS: [Tab; 9] = [
+    Tab::Files,
+    Tab::History,
+    Tab::Selection,
+    Tab::Markers,
+    Tab::EffectsRack,
+    Tab::PhaseMeter,
+    Tab::Loudness,
+    Tab::MatchLoudness,
+    Tab::Levels,
+];
+
 /// Re-open a closed panel next to the other non-editor panels, or in a new strip under the editor.
 fn show_panel(dock: &mut DockState<Tab>, tab: Tab) {
     let target = dock
@@ -1657,6 +1819,37 @@ impl eframe::App for BoothcraftApp {
             .and_then(|sh| sh.phase_correlation());
         self.state.meters.update_phase(phase);
 
+        #[cfg(target_os = "macos")]
+        {
+            for action in self.native_menu.poll() {
+                self.state.dispatch_native_action(&mut self.dock, action);
+            }
+            let panels_open: Vec<bool> = WINDOW_TABS
+                .iter()
+                .map(|tab| self.dock.find_tab(tab).is_some())
+                .collect();
+            let active = self.state.files.get(self.state.active);
+            self.native_menu.sync(&crate::native_menu::SyncState {
+                recording: self.state.recording.is_some(),
+                has_file: !self.state.files.is_empty(),
+                can_undo: active.is_some_and(|f| f.history.can_undo()),
+                can_redo: active.is_some_and(|f| f.history.can_redo()),
+                has_selection: active.is_some_and(|f| !f.selection.is_empty()),
+                has_clip: self.state.clips.active_clip().is_some(),
+                snap_enabled: self.state.display.snap.enabled,
+                snap_markers: self.state.display.snap.markers,
+                snap_ruler: self.state.display.snap.ruler,
+                snap_zero_crossings: self.state.display.snap.zero_crossings,
+                active_clipboard: self.state.clips.active,
+                view_mode: self.state.display.spectral.mode,
+                fft_size: self.state.display.spectral.fft_size,
+                window: self.state.display.spectral.window,
+                color_map: self.state.display.spectral.color_map,
+                freq_axis: self.state.display.spectral.freq_axis,
+                panels_open: &panels_open,
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
         egui::Panel::top("menu").show(ui, |ui| self.state.menu(ui, &mut self.dock));
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
