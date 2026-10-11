@@ -4,8 +4,7 @@ An open-source, cross-platform audio editor in Rust, aiming for feature parity w
 editor of professional desktop audio tools. Multitrack sessions are out of scope.
 
 ## Status
-
-Early. Milestone 0 and part of milestone 1 are in place; see [docs/parity.md](docs/parity.md).
+<img width="1392" height="904" alt="Screenshot 2026-10-11 at 00 14 50" src="https://github.com/user-attachments/assets/4ad31479-df69-4c21-8cc5-f7576343400b" />Early. Milestone 0 and part of milestone 1 are in place; see [docs/parity.md](docs/parity.md).
 
 ## Build and run
 
